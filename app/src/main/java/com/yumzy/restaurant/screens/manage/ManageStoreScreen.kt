@@ -6,6 +6,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.Logout
 
@@ -30,6 +31,7 @@ import com.yumzy.restaurant.data.MiniRestaurant
 fun ManageStoreScreen(
     restaurant: MiniRestaurant,
     onManageItemsClicked: () -> Unit,
+    onNavigateToHistory: () -> Unit, // <-- ADDED THIS
     onSignOut: () -> Unit
 ) {
     // This state holds the current open/closed status
@@ -92,6 +94,19 @@ fun ManageStoreScreen(
             ) {
                 Text("Manage Store Items", fontSize = 16.sp)
             }
+
+            // --- NEW BUTTON ---
+            OutlinedButton(
+                onClick = onNavigateToHistory,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(50.dp)
+            ) {
+                Icon(Icons.Default.History, contentDescription = "History")
+                Spacer(Modifier.width(8.dp))
+                Text("View Delivery History", fontSize = 16.sp)
+            }
+            // --- END OF NEW BUTTON ---
         }
     }
 }

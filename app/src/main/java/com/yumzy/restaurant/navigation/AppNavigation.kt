@@ -18,6 +18,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.yumzy.restaurant.data.MiniRestaurant
+import com.yumzy.restaurant.screens.history.DeliveryHistoryScreen
 import com.yumzy.restaurant.screens.manage.ManageStoreScreen
 import com.yumzy.restaurant.screens.manage.RestaurantItemListScreen
 import com.yumzy.restaurant.screens.manage.RestaurantSubCategoryScreen
@@ -31,6 +32,7 @@ sealed class Screen(val route: String) {
     // Bottom Nav Screens
     data object Orders : Screen("orders")
     data object Manage : Screen("manage")
+    data object History : Screen("history") // <-- ADDED THIS
 
     // Other screens (for navigation)
     data object SubCategories : Screen("sub_categories")
@@ -95,9 +97,21 @@ fun AppNavigation(
                     onManageItemsClicked = {
                         navController.navigate(Screen.SubCategories.route)
                     },
+                    onNavigateToHistory = { // <-- ADDED THIS
+                        navController.navigate(Screen.History.route)
+                    },
                     onSignOut = onSignOut
                 )
             }
+
+            // --- NEW COMPOSABLE FOR HISTORY ---
+            composable(Screen.History.route) {
+                DeliveryHistoryScreen(
+                    restaurantName = restaurant.name ?: "",
+                    onBack = { navController.popBackStack() }
+                )
+            }
+            // --- END OF NEW COMPOSABLE ---
 
             // Sub-Category Screen (navigated from Manage)
             composable(Screen.SubCategories.route) {

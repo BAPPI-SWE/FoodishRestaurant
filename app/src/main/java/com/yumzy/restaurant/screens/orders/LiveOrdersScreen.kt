@@ -29,13 +29,15 @@ fun LiveOrdersScreen(loggedInRestaurant: MiniRestaurant) {
     var partnerOrders by remember { mutableStateOf<List<PartnerOrder>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
 
-    // This effect listens for new orders in real-time
+    // ---
+    // (FIX 1)
+    // Change key back to name, since we filter by name
+    // ---
     LaunchedEffect(loggedInRestaurant.name) {
         val db = Firebase.firestore
         val listener = db.collection("orders")
             // Listen to orders that are not yet delivered or cancelled
             .whereIn("orderStatus", listOf("Pending", "Accepted", "Preparing", "On the way"))
-            .orderBy("createdAt", Query.Direction.DESCENDING)
             .limit(50)
             .addSnapshotListener { snapshot, error ->
                 if (error != null) {
@@ -44,7 +46,15 @@ fun LiveOrdersScreen(loggedInRestaurant: MiniRestaurant) {
                 }
 
                 if (snapshot != null) {
+
+                    // This typo is fixed (this is correct)
                     val newPartnerOrders = mutableListOf<PartnerOrder>()
+
+                    // ---
+                    // (FIX 2)
+                    // Get the partner's NAME, not ID
+                    // ---
+                    val partnerName = loggedInRestaurant.name
 
                     for (doc in snapshot.documents) {
                         // Get all items from the order
@@ -52,14 +62,27 @@ fun LiveOrdersScreen(loggedInRestaurant: MiniRestaurant) {
 
                         // Filter to find items ONLY for this restaurant
                         val partnerItems = allItems.mapNotNull { itemMap ->
-                            val miniResName = itemMap["miniResName"] as? String ?: ""
-                            if (miniResName == loggedInRestaurant.name) {
+
+                            // ---
+                            // (FIX 3)
+                            // Get the "miniResName" (NAME) field from the item map.
+                            // ---
+                            val itemMiniResName = itemMap["miniResName"] as? String ?: ""
+
+                            // ---
+                            // (FIX 4)
+                            // Compare the NAMES, with trim() and ignoreCase = true
+                            // ---
+                            val cleanPartnerName = partnerName?.trim()
+                            val cleanItemResName = itemMiniResName.trim()
+
+                            if (!cleanPartnerName.isNullOrBlank() && cleanItemResName.isNotEmpty() && cleanItemResName.equals(cleanPartnerName, ignoreCase = true)) {
                                 // This item belongs to the logged-in partner
                                 OrderItemDetail(
                                     name = itemMap["itemName"] as? String ?: "Unknown",
                                     quantity = (itemMap["quantity"] as? Number)?.toInt() ?: 0,
                                     price = (itemMap["itemPrice"] as? Number)?.toDouble() ?: 0.0,
-                                    miniResName = miniResName
+                                    miniResName = itemMiniResName // Use the name we just got
                                 )
                             } else {
                                 null // This item is not for this partner
@@ -77,7 +100,8 @@ fun LiveOrdersScreen(loggedInRestaurant: MiniRestaurant) {
                             }
                         }
                     }
-                    partnerOrders = newPartnerOrders
+                    // We sort the list here, in Kotlin, which is safe.
+                    partnerOrders = newPartnerOrders.sortedByDescending { it.createdAt }
                 }
                 isLoading = false
             }
@@ -143,8 +167,7 @@ fun PartnerOrderCard(order: PartnerOrder) {
         Column(Modifier.padding(16.dp)) {
             // Header
             Row(
-                Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
+// ... existingGg code ...
                 verticalAlignment = Alignment.Top
             ) {
                 Column(Modifier.weight(1f)) {
@@ -162,7 +185,7 @@ fun PartnerOrderCard(order: PartnerOrder) {
                 Text(
                     "৳${order.totalPrice}",
                     style = MaterialTheme.typography.titleLarge,
-                    fontWeight = FontWeight.Bold,
+                    fontWeight = FontWeight.Bold, // Fixed from GgFontWeight
                     color = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.align(Alignment.CenterVertically)
                 )

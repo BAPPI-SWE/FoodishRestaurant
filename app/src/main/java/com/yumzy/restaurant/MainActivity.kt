@@ -1,5 +1,7 @@
 package com.yumzy.restaurant
 
+import android.content.Intent
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -10,6 +12,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -18,6 +21,7 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.yumzy.restaurant.auth.AuthScreen
 import com.yumzy.restaurant.navigation.AppNavigation
+import com.yumzy.restaurant.services.OrderMonitorService
 import com.yumzy.restaurant.ui.theme.YumzyRestaurantTheme
 
 class MainActivity : ComponentActivity() {
@@ -26,29 +30,54 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+
+        // Request Notification Permission for Android 13+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 101)
+        }
+
         setContent {
             YumzyRestaurantTheme {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
                     color = MaterialTheme.colorScheme.background
                 ) {
-                    // Pass the viewmodel, not the state
-                    AppEntry(viewModel = mainViewModel)
+                    AppEntry(
+                        viewModel = mainViewModel,
+                        onStartService = { startOrderService() },
+                        onStopService = { stopOrderService() }
+                    )
                 }
             }
         }
     }
+
+    private fun startOrderService() {
+        val serviceIntent = Intent(this, OrderMonitorService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(serviceIntent)
+        } else {
+            startService(serviceIntent)
+        }
+    }
+
+    private fun stopOrderService() {
+        val serviceIntent = Intent(this, OrderMonitorService::class.java)
+        stopService(serviceIntent)
+    }
 }
 
 @Composable
-fun AppEntry(viewModel: MainViewModel) {
+fun AppEntry(
+    viewModel: MainViewModel,
+    onStartService: () -> Unit,
+    onStopService: () -> Unit
+) {
     val navController = rememberNavController()
-
-    // Get the state values from the ViewModel
     val isLoading by viewModel.isLoading
     val loggedInRestaurant by viewModel.loggedInRestaurant
 
-    // Show a loading spinner while the ViewModel checks SharedPreferences
+    // Show loading spinner while checking SharedPreferences
     if (isLoading) {
         Box(
             modifier = Modifier.fillMaxSize(),
@@ -56,10 +85,9 @@ fun AppEntry(viewModel: MainViewModel) {
         ) {
             CircularProgressIndicator()
         }
-        return // Don't proceed until loading is finished
+        return
     }
 
-    // Determine the start destination *after* loading
     val startDestination = if (loggedInRestaurant != null) "main_app" else "auth"
 
     NavHost(navController = navController, startDestination = startDestination) {
@@ -67,10 +95,7 @@ fun AppEntry(viewModel: MainViewModel) {
         composable("auth") {
             AuthScreen(
                 onLoginSuccess = { restaurant ->
-                    // Save the login using the ViewModel
                     viewModel.saveLogin(restaurant)
-
-                    // Navigate to the main app and clear the login screen from history
                     navController.navigate("main_app") {
                         popUpTo("auth") { inclusive = true }
                     }
@@ -78,27 +103,29 @@ fun AppEntry(viewModel: MainViewModel) {
             )
         }
 
-        // Main App Screen (with bottom navigation)
+        // Main App Screen
         composable("main_app") {
-            // Get the restaurant from the ViewModel's state
+            // Start the background service when entering main app
+            LaunchedEffect(Unit) {
+                onStartService()
+            }
+
             val currentRestaurant = viewModel.loggedInRestaurant.value
             if (currentRestaurant != null) {
-                // Pass the restaurant details to the main app navigation
                 AppNavigation(
                     restaurant = currentRestaurant,
                     onSignOut = {
-                        // Clear the login using the ViewModel
+                        // Stop the service on sign out
+                        onStopService()
                         viewModel.clearLogin()
-
                         navController.navigate("auth") {
                             popUpTo("main_app") { inclusive = true }
                         }
                     }
                 )
             } else {
-                // This case should now only happen if state is lost unexpectedly
                 navController.navigate("auth") {
-                    popUpTo(0) { inclusive = true } // Clear entire back stack
+                    popUpTo(0) { inclusive = true }
                 }
             }
         }

@@ -271,8 +271,6 @@ fun AddEditStoreItemDialog(
     var price by remember { mutableStateOf(item?.price?.toString() ?: "") }
     var description by remember { mutableStateOf(item?.itemDescription ?: "") }
     var selectedImageUri by remember { mutableStateOf<Uri?>(null) }
-    var deliveryCharge by remember { mutableStateOf(item?.additionalDeliveryCharge?.toString() ?: "0") }
-    var serviceCharge by remember { mutableStateOf(item?.additionalServiceCharge?.toString() ?: "0") }
 
     // Multi-variant fields
     var hasMultiVariant by remember { mutableStateOf(false) }
@@ -491,18 +489,6 @@ fun AddEditStoreItemDialog(
                     }
 
                     TextField(value = description, onValueChange = { description = it }, label = { Text("Description (Optional)") }, maxLines = 3)
-                    TextField(
-                        value = deliveryCharge,
-                        onValueChange = { deliveryCharge = it },
-                        label = { Text("Additional Delivery Charge") },
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
-                    )
-                    TextField(
-                        value = serviceCharge,
-                        onValueChange = { serviceCharge = it },
-                        label = { Text("Additional Service Charge") },
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
-                    )
 
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                         if (item != null && onDelete != null) {
@@ -542,9 +528,6 @@ fun AddEditStoreItemDialog(
                         Row {
                             TextButton(onClick = onDismiss) { Text("Cancel") }
                             Button(onClick = {
-                                val deliveryDouble = deliveryCharge.toDoubleOrNull() ?: 0.0
-                                val serviceDouble = serviceCharge.toDoubleOrNull() ?: 0.0
-
                                 if (name.isBlank()) {
                                     Toast.makeText(context, "Item name is required.", Toast.LENGTH_SHORT).show()
                                     return@Button
@@ -557,8 +540,6 @@ fun AddEditStoreItemDialog(
                                 val newItemData = hashMapOf<String, Any>(
                                     "name" to name,
                                     "itemDescription" to description,
-                                    "additionalDeliveryCharge" to deliveryDouble,
-                                    "additionalServiceCharge" to serviceDouble,
                                     "miniRes" to fixedMiniResId,
                                     "subCategory" to fixedSubCategory,
                                     "stock" to (item?.stock ?: "yes")

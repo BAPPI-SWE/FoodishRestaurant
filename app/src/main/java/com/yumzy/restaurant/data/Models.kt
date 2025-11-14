@@ -9,12 +9,12 @@ import com.google.firebase.Timestamp
  */
 data class MiniRestaurant(
     val id: String = "",
-    val name: String? = null, // Changed
-    val imageUrl: String? = null, // Changed
-    val open: String? = "yes", // Changed
-    val parentCategory: String? = null, // Changed
-    val availableLocations: List<String>? = emptyList(), // Changed
-    val password: String? = null // Changed (This is the most important one)
+    val name: String? = null,
+    val imageUrl: String? = null,
+    val open: String? = "yes",
+    val parentCategory: String? = null,
+    val availableLocations: List<String>? = emptyList(),
+    val password: String? = null
 )
 
 /**
@@ -31,7 +31,7 @@ data class StoreSubCategory(
 
 /**
  * Represents an item in a store.
- * (Copied from Admin app)
+ * --- UPDATED: Removed additionalDeliveryCharge and additionalServiceCharge ---
  */
 data class StoreItem(
     val id: String = "",
@@ -41,8 +41,6 @@ data class StoreItem(
     val itemDescription: String = "",
     val subCategory: String = "",
     val miniRes: String = "", // The ID of the mini restaurant
-    val additionalDeliveryCharge: Double = 0.0,
-    val additionalServiceCharge: Double = 0.0,
     val stock: String = "yes" // "yes" or "no"
 )
 

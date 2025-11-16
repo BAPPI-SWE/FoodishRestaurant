@@ -18,6 +18,7 @@ import com.google.firebase.firestore.ListenerRegistration
 import com.google.firebase.firestore.ktx.firestore
 import com.google.firebase.ktx.Firebase
 import com.yumzy.restaurant.MainActivity
+import com.yumzy.restaurant.OrderAlarmActivity
 import com.yumzy.restaurant.R
 
 class OrderMonitorService : Service() {
@@ -36,7 +37,6 @@ class OrderMonitorService : Service() {
     }
 
     private fun startFirestoreListener() {
-        // Get the logged-in restaurant name from SharedPreferences
         val sharedPrefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val restaurantName = sharedPrefs.getString("res_name", null)
 
@@ -48,7 +48,6 @@ class OrderMonitorService : Service() {
 
         val db = Firebase.firestore
 
-        // Listen to orders that contain items for this restaurant
         firestoreListener = db.collection("orders")
             .whereIn("orderStatus", listOf("Pending", "Accepted", "Preparing", "On the way"))
             .addSnapshotListener { snapshots, e ->
@@ -59,11 +58,9 @@ class OrderMonitorService : Service() {
 
                 if (snapshots != null) {
                     for (dc in snapshots.documentChanges) {
-                        // ONLY trigger for NEW documents added while listening
                         if (dc.type == DocumentChange.Type.ADDED) {
                             val allItems = dc.document.get("items") as? List<Map<String, Any>> ?: emptyList()
 
-                            // Check if any item belongs to this restaurant
                             val hasRestaurantItems = allItems.any { itemMap ->
                                 val itemMiniResName = itemMap["miniResName"] as? String ?: ""
                                 itemMiniResName.trim().equals(restaurantName.trim(), ignoreCase = true)
@@ -74,13 +71,12 @@ class OrderMonitorService : Service() {
                                 val customerName = dc.document.getString("userName") ?: "Customer"
                                 val orderStatus = dc.document.getString("orderStatus") ?: "New"
 
-                                // Count items for this restaurant
                                 val itemCount = allItems.count { itemMap ->
                                     val itemMiniResName = itemMap["miniResName"] as? String ?: ""
                                     itemMiniResName.trim().equals(restaurantName.trim(), ignoreCase = true)
                                 }
 
-                                triggerSoundAndNotification(orderId, customerName, orderStatus, itemCount)
+                                triggerAlarmAndNotification(orderId, customerName, orderStatus, itemCount)
                             }
                         }
                     }
@@ -88,18 +84,35 @@ class OrderMonitorService : Service() {
             }
     }
 
-    private fun triggerSoundAndNotification(
+    private fun triggerAlarmAndNotification(
         orderId: String,
         customerName: String,
         orderStatus: String,
         itemCount: Int
     ) {
-        val soundUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+        // Launch full-screen alarm activity
+        val alarmIntent = Intent(this, OrderAlarmActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra("ORDER_ID", orderId)
+            putExtra("CUSTOMER_NAME", customerName)
+            putExtra("ORDER_STATUS", orderStatus)
+            putExtra("ITEM_COUNT", itemCount)
+        }
 
-        val intent = Intent(this, MainActivity::class.java).apply {
+        val fullScreenPendingIntent = PendingIntent.getActivity(
+            this,
+            System.currentTimeMillis().toInt(),
+            alarmIntent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        // Also create a regular notification as backup
+        val mainIntent = Intent(this, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TASK
         }
-        val pendingIntent = PendingIntent.getActivity(this, 0, intent, PendingIntent.FLAG_IMMUTABLE)
+        val pendingIntent = PendingIntent.getActivity(this, 0, mainIntent, PendingIntent.FLAG_IMMUTABLE)
+
+        val soundUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
 
         val notification = NotificationCompat.Builder(this, CHANNEL_ID_ALERTS)
             .setSmallIcon(R.mipmap.ic_launcher_round)
@@ -113,12 +126,16 @@ class OrderMonitorService : Service() {
             .setCategory(NotificationCompat.CATEGORY_ALARM)
             .setSound(soundUri)
             .setContentIntent(pendingIntent)
+            .setFullScreenIntent(fullScreenPendingIntent, true) // This triggers the full-screen alarm
             .setAutoCancel(true)
             .setVibrate(longArrayOf(0, 500, 200, 500))
             .build()
 
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         manager.notify(System.currentTimeMillis().toInt(), notification)
+
+        // Launch the alarm activity directly
+        startActivity(alarmIntent)
     }
 
     private fun createForegroundNotification(): Notification {
@@ -147,10 +164,12 @@ class OrderMonitorService : Service() {
             }
             manager.createNotificationChannel(serviceChannel)
 
-            // Loud Channel for New Orders
-            val soundUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+            // Loud Channel for New Orders with HIGH importance
+            val soundUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+
             val audioAttributes = AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                .setUsage(AudioAttributes.USAGE_ALARM)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                 .build()
 

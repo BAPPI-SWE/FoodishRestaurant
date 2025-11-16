@@ -32,8 +32,15 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         // Request Notification Permission for Android 13+
+        // UPDATED: Added USE_FULL_SCREEN_INTENT permission
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            requestPermissions(arrayOf(android.Manifest.permission.POST_NOTIFICATIONS), 101)
+            requestPermissions(
+                arrayOf(
+                    android.Manifest.permission.POST_NOTIFICATIONS,
+                    android.Manifest.permission.USE_FULL_SCREEN_INTENT
+                ),
+                101
+            )
         }
 
         setContent {

@@ -25,19 +25,38 @@ import coil.compose.AsyncImage
 import com.google.firebase.firestore.ktx.firestore
 import com.google.firebase.ktx.Firebase
 import com.yumzy.restaurant.data.MiniRestaurant
+import kotlinx.coroutines.tasks.await
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ManageStoreScreen(
     restaurant: MiniRestaurant,
     onManageItemsClicked: () -> Unit,
-    onNavigateToHistory: () -> Unit, // <-- ADDED THIS
+    onNavigateToHistory: () -> Unit,
     onSignOut: () -> Unit
 ) {
-    // This state holds the current open/closed status
-    var isOpen by remember(restaurant.open) { mutableStateOf(restaurant.open.equals("yes", true)) }
+    // FIX: Fetch the current status from Firestore instead of using cached value
+    var isOpen by remember { mutableStateOf(restaurant.open.equals("yes", true)) }
+    var isLoading by remember { mutableStateOf(true) }
     val context = LocalContext.current
     var isUpdating by remember { mutableStateOf(false) }
+
+    // Fetch current status from Firestore when screen loads
+    LaunchedEffect(restaurant.id) {
+        try {
+            val doc = Firebase.firestore.collection("mini_restaurants")
+                .document(restaurant.id)
+                .get()
+                .await()
+
+            val currentStatus = doc.getString("open") ?: "yes"
+            isOpen = currentStatus.equals("yes", ignoreCase = true)
+        } catch (e: Exception) {
+            Toast.makeText(context, "Error loading status: ${e.message}", Toast.LENGTH_SHORT).show()
+        } finally {
+            isLoading = false
+        }
+    }
 
     fun updateStatus(newStatus: Boolean) {
         isUpdating = true
@@ -74,16 +93,28 @@ fun ManageStoreScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // Re-usable card showing restaurant info
-            MiniRestaurantPartnerCard(
-                restaurant = restaurant,
-                isOpen = isOpen,
-                onStatusChange = { newStatus ->
-                    if (!isUpdating) {
-                        updateStatus(newStatus)
-                    }
+            // Show loading indicator while fetching status
+            if (isLoading) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(180.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    CircularProgressIndicator()
                 }
-            )
+            } else {
+                // Re-usable card showing restaurant info
+                MiniRestaurantPartnerCard(
+                    restaurant = restaurant,
+                    isOpen = isOpen,
+                    onStatusChange = { newStatus ->
+                        if (!isUpdating) {
+                            updateStatus(newStatus)
+                        }
+                    }
+                )
+            }
 
             // "Manage Items" button
             Button(
@@ -95,7 +126,6 @@ fun ManageStoreScreen(
                 Text("Manage Store Items", fontSize = 16.sp)
             }
 
-            // --- NEW BUTTON ---
             OutlinedButton(
                 onClick = onNavigateToHistory,
                 modifier = Modifier
@@ -106,7 +136,6 @@ fun ManageStoreScreen(
                 Spacer(Modifier.width(8.dp))
                 Text("View Delivery History", fontSize = 16.sp)
             }
-            // --- END OF NEW BUTTON ---
         }
     }
 }
@@ -126,8 +155,8 @@ fun MiniRestaurantPartnerCard(
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
             AsyncImage(
-                model = restaurant.imageUrl ?: "", // <-- FIX HERE
-                contentDescription = restaurant.name ?: "Restaurant Image", // <-- FIX HERE
+                model = restaurant.imageUrl ?: "",
+                contentDescription = restaurant.name ?: "Restaurant Image",
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize()
             )
@@ -169,7 +198,7 @@ fun MiniRestaurantPartnerCard(
                     )
                 }
                 Text(
-                    text = restaurant.name ?: "Unnamed Restaurant", // <-- FIX HERE
+                    text = restaurant.name ?: "Unnamed Restaurant",
                     style = MaterialTheme.typography.titleLarge,
                     fontWeight = FontWeight.Bold,
                     color = Color.White,

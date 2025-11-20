@@ -18,8 +18,8 @@ import androidx.compose.ui.unit.dp
 import com.google.firebase.firestore.Query
 import com.google.firebase.firestore.ktx.firestore
 import com.google.firebase.ktx.Firebase
-import com.yumzy.restaurant.data.OrderItemDetail // Re-use model
-import com.yumzy.restaurant.data.PartnerOrder // Re-use model
+import com.yumzy.restaurant.data.OrderItemDetail
+import com.yumzy.restaurant.data.PartnerOrder
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -50,7 +50,6 @@ fun DeliveryHistoryScreen(
         ).show()
     }
 
-    // This effect fetches the delivered orders
     LaunchedEffect(restaurantName) {
         if (restaurantName.isBlank()) {
             isLoading = false
@@ -58,11 +57,10 @@ fun DeliveryHistoryScreen(
         }
 
         val db = Firebase.firestore
-        // Listen to "Delivered" orders
         db.collection("orders")
             .whereEqualTo("orderStatus", "Delivered")
             .orderBy("createdAt", Query.Direction.DESCENDING)
-            .limit(100) // Limit history to recent 100
+            .limit(100)
             .addSnapshotListener { snapshot, error ->
                 if (error != null) {
                     isLoading = false
@@ -72,11 +70,9 @@ fun DeliveryHistoryScreen(
                 if (snapshot != null) {
                     val partnerOrders = mutableListOf<PartnerOrder>()
 
-                    // Loop through delivered orders
                     for (doc in snapshot.documents) {
                         val allItems = doc.get("items") as? List<Map<String, Any>> ?: emptyList()
 
-                        // Filter to find items ONLY for this restaurant
                         val partnerItems = allItems.mapNotNull { itemMap ->
                             val itemMiniResName = itemMap["miniResName"] as? String ?: ""
                             val cleanPartnerName = restaurantName.trim()
@@ -86,7 +82,7 @@ fun DeliveryHistoryScreen(
                                 OrderItemDetail(
                                     name = itemMap["itemName"] as? String ?: "Unknown",
                                     quantity = (itemMap["quantity"] as? Number)?.toInt() ?: 0,
-                                    price = (itemMap["itemPrice"] as? Number)?.toDouble() ?: 0.0,
+                                    price = (itemMap["price"] as? Number)?.toDouble() ?: 0.0,
                                     miniResName = itemMiniResName
                                 )
                             } else {
@@ -94,11 +90,10 @@ fun DeliveryHistoryScreen(
                             }
                         }
 
-                        // If this order contained items from our store, add it
                         if (partnerItems.isNotEmpty()) {
                             val order = doc.toObject(PartnerOrder::class.java)?.copy(
                                 id = doc.id,
-                                items = partnerItems // Set the FILTERED list
+                                items = partnerItems
                             )
                             if (order != null) {
                                 partnerOrders.add(order)
@@ -111,8 +106,6 @@ fun DeliveryHistoryScreen(
             }
     }
 
-
-    // Filter orders based on search and date range
     val filteredOrders by remember(searchText, completedOrders, startDate, endDate) {
         derivedStateOf {
             val calendar = Calendar.getInstance()
@@ -153,13 +146,10 @@ fun DeliveryHistoryScreen(
         }
     }
 
-    // Calculate totals based on the *filtered* list
     val totalDeliveries = filteredOrders.size
-    // Calculate earnings based on *partner's items*, not the total order price
     val totalEarnings = filteredOrders.sumOf { partnerOrder ->
         partnerOrder.items.sumOf { item -> item.price * item.quantity }
     }
-
 
     Scaffold(
         topBar = {
@@ -179,7 +169,6 @@ fun DeliveryHistoryScreen(
                 .padding(paddingValues)
                 .padding(16.dp)
         ) {
-            // Search Bar
             OutlinedTextField(
                 value = searchText,
                 onValueChange = { searchText = it },
@@ -190,7 +179,6 @@ fun DeliveryHistoryScreen(
             )
             Spacer(modifier = Modifier.height(8.dp))
 
-            // Date Filter Buttons
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
@@ -221,7 +209,6 @@ fun DeliveryHistoryScreen(
                 }
             }
             else {
-                // Summary Card
                 SummaryCard(
                     totalDeliveries = totalDeliveries,
                     totalEarnings = totalEarnings
@@ -237,7 +224,6 @@ fun DeliveryHistoryScreen(
                         Text(emptyText, color = Color.Gray)
                     }
                 } else {
-                    // List of History Cards
                     LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                         items(filteredOrders) { order ->
                             PartnerHistoryOrderCard(order = order)
@@ -249,9 +235,6 @@ fun DeliveryHistoryScreen(
     }
 }
 
-/**
- * A card to display the summary of total deliveries and earnings.
- */
 @Composable
 fun SummaryCard(totalDeliveries: Int, totalEarnings: Double) {
     Card(
@@ -294,15 +277,9 @@ fun SummaryCard(totalDeliveries: Int, totalEarnings: Double) {
     }
 }
 
-
-/**
- * A card for a single completed order, adapted from LiveOrdersScreen
- */
 @Composable
 fun PartnerHistoryOrderCard(order: PartnerOrder) {
     val sdf = remember { SimpleDateFormat("dd MMM yyyy, hh:mm a", Locale.getDefault()) }
-
-    // Calculate this partner's earnings for this specific order
     val partnerEarnings = order.items.sumOf { it.price * it.quantity }
 
     Card(
@@ -310,7 +287,6 @@ fun PartnerHistoryOrderCard(order: PartnerOrder) {
         elevation = CardDefaults.cardElevation(2.dp)
     ) {
         Column(Modifier.padding(16.dp)) {
-            // Header
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.Top,
@@ -327,7 +303,6 @@ fun PartnerHistoryOrderCard(order: PartnerOrder) {
                         style = MaterialTheme.typography.bodyMedium
                     )
                 }
-                // Show partner's earnings for this order
                 Text(
                     "Your Cut: ৳$partnerEarnings",
                     style = MaterialTheme.typography.titleMedium,
@@ -347,7 +322,6 @@ fun PartnerHistoryOrderCard(order: PartnerOrder) {
             Divider()
             Spacer(Modifier.height(8.dp))
 
-            // Your Items in this Order
             Text(
                 "Your Items in this Order:",
                 style = MaterialTheme.typography.labelLarge,

@@ -58,12 +58,14 @@ data class OrderItemDetail(
 /**
  * A custom Order class for the partner.
  * It will only contain items relevant to this partner.
+ * --- UPDATED: Added userPhone field ---
  */
 data class PartnerOrder(
     val id: String = "",
     val orderStatus: String = "",
     val userName: String = "",
     val userSubLocation: String = "",
+    val userPhone: String = "", // Added this field
     val totalPrice: Double = 0.0, // This is the TOTAL order price
     val createdAt: Timestamp = Timestamp.now(),
     val items: List<OrderItemDetail> = emptyList() // This list is FILTERED

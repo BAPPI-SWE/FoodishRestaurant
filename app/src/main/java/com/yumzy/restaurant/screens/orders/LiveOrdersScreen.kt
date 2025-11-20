@@ -1,25 +1,34 @@
 package com.yumzy.restaurant.screens.orders
 
+import android.content.Intent
+import android.net.Uri
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Call
+import androidx.compose.material.icons.filled.Chat
+import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.Storefront
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.google.firebase.firestore.Query
+import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.ktx.firestore
 import com.google.firebase.ktx.Firebase
 import com.yumzy.restaurant.data.MiniRestaurant
 import com.yumzy.restaurant.data.OrderItemDetail
 import com.yumzy.restaurant.data.PartnerOrder
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -29,14 +38,9 @@ fun LiveOrdersScreen(loggedInRestaurant: MiniRestaurant) {
     var partnerOrders by remember { mutableStateOf<List<PartnerOrder>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
 
-    // ---
-    // (FIX 1)
-    // Change key back to name, since we filter by name
-    // ---
     LaunchedEffect(loggedInRestaurant.name) {
         val db = Firebase.firestore
         val listener = db.collection("orders")
-            // Listen to orders that are not yet delivered or cancelled
             .whereIn("orderStatus", listOf("Pending", "Accepted", "Preparing", "On the way"))
             .limit(50)
             .addSnapshotListener { snapshot, error ->
@@ -46,68 +50,43 @@ fun LiveOrdersScreen(loggedInRestaurant: MiniRestaurant) {
                 }
 
                 if (snapshot != null) {
-
-                    // This typo is fixed (this is correct)
                     val newPartnerOrders = mutableListOf<PartnerOrder>()
-
-                    // ---
-                    // (FIX 2)
-                    // Get the partner's NAME, not ID
-                    // ---
                     val partnerName = loggedInRestaurant.name
 
                     for (doc in snapshot.documents) {
-                        // Get all items from the order
                         val allItems = doc.get("items") as? List<Map<String, Any>> ?: emptyList()
 
-                        // Filter to find items ONLY for this restaurant
                         val partnerItems = allItems.mapNotNull { itemMap ->
-
-                            // ---
-                            // (FIX 3)
-                            // Get the "miniResName" (NAME) field from the item map.
-                            // ---
                             val itemMiniResName = itemMap["miniResName"] as? String ?: ""
-
-                            // ---
-                            // (FIX 4)
-                            // Compare the NAMES, with trim() and ignoreCase = true
-                            // ---
                             val cleanPartnerName = partnerName?.trim()
                             val cleanItemResName = itemMiniResName.trim()
 
                             if (!cleanPartnerName.isNullOrBlank() && cleanItemResName.isNotEmpty() && cleanItemResName.equals(cleanPartnerName, ignoreCase = true)) {
-                                // This item belongs to the logged-in partner
                                 OrderItemDetail(
                                     name = itemMap["itemName"] as? String ?: "Unknown",
                                     quantity = (itemMap["quantity"] as? Number)?.toInt() ?: 0,
-                                    price = (itemMap["itemPrice"] as? Number)?.toDouble() ?: 0.0,
-                                    miniResName = itemMiniResName // Use the name we just got
+                                    price = (itemMap["price"] as? Number)?.toDouble() ?: 0.0,
+                                    miniResName = itemMiniResName
                                 )
                             } else {
-                                null // This item is not for this partner
+                                null
                             }
                         }
 
-                        // If we found any items for this partner, create a PartnerOrder
                         if (partnerItems.isNotEmpty()) {
                             val order = doc.toObject(PartnerOrder::class.java)?.copy(
                                 id = doc.id,
-                                items = partnerItems // Set the FILTERED list of items
+                                items = partnerItems
                             )
                             if (order != null) {
                                 newPartnerOrders.add(order)
                             }
                         }
                     }
-                    // We sort the list here, in Kotlin, which is safe.
                     partnerOrders = newPartnerOrders.sortedByDescending { it.createdAt }
                 }
                 isLoading = false
             }
-
-        // Remember to remove the listener when the composable is destroyed
-        // (This part is handled by LaunchedEffect's coroutine scope)
     }
 
     Scaffold(
@@ -140,7 +119,10 @@ fun LiveOrdersScreen(loggedInRestaurant: MiniRestaurant) {
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     items(partnerOrders) { order ->
-                        PartnerOrderCard(order = order)
+                        PartnerOrderCard(
+                            order = order,
+                            partnerName = loggedInRestaurant.name ?: ""
+                        )
                     }
                 }
             }
@@ -149,8 +131,11 @@ fun LiveOrdersScreen(loggedInRestaurant: MiniRestaurant) {
 }
 
 @Composable
-fun PartnerOrderCard(order: PartnerOrder) {
+fun PartnerOrderCard(order: PartnerOrder, partnerName: String) {
     val sdf = remember { SimpleDateFormat("dd MMM, hh:mm a", Locale.getDefault()) }
+    val context = LocalContext.current
+    var isUpdating by remember { mutableStateOf(false) }
+
     val statusColor = when (order.orderStatus) {
         "Pending" -> Color(0xFF757575)
         "Accepted", "Preparing" -> Color(0xFF0D47A1)
@@ -159,15 +144,42 @@ fun PartnerOrderCard(order: PartnerOrder) {
         else -> Color.Black
     }
 
+    suspend fun updatePartnerStatus(orderId: String, newStatus: String) {
+        isUpdating = true
+        try {
+            val db = Firebase.firestore
+            val orderRef = db.collection("orders").document(orderId)
+            val orderDoc = orderRef.get().await()
+
+            val items = orderDoc.get("items") as? List<Map<String, Any>> ?: emptyList()
+            val updatedItems = items.map { item ->
+                val itemMiniResName = item["miniResName"] as? String ?: ""
+                if (itemMiniResName.trim().equals(partnerName.trim(), ignoreCase = true)) {
+                    item.toMutableMap().apply {
+                        put("partnerStatus", newStatus)
+                    }
+                } else {
+                    item
+                }
+            }
+
+            orderRef.update("items", updatedItems).await()
+            Toast.makeText(context, "Status updated to $newStatus", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(context, "Failed to update: ${e.message}", Toast.LENGTH_SHORT).show()
+        } finally {
+            isUpdating = false
+        }
+    }
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         elevation = CardDefaults.cardElevation(3.dp),
         shape = RoundedCornerShape(12.dp)
     ) {
         Column(Modifier.padding(16.dp)) {
-            // Header
             Row(
-// ... existingGg code ...
+                modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.Top
             ) {
                 Column(Modifier.weight(1f)) {
@@ -185,7 +197,7 @@ fun PartnerOrderCard(order: PartnerOrder) {
                 Text(
                     "৳${order.totalPrice}",
                     style = MaterialTheme.typography.titleLarge,
-                    fontWeight = FontWeight.Bold, // Fixed from GgFontWeight
+                    fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary,
                     modifier = Modifier.align(Alignment.CenterVertically)
                 )
@@ -195,7 +207,6 @@ fun PartnerOrderCard(order: PartnerOrder) {
             Divider()
             Spacer(Modifier.height(12.dp))
 
-            // Your Items in this Order
             Text(
                 "Your Items:",
                 style = MaterialTheme.typography.titleSmall,
@@ -203,7 +214,6 @@ fun PartnerOrderCard(order: PartnerOrder) {
             )
             Spacer(Modifier.height(4.dp))
 
-            // This list ONLY contains this partner's items
             order.items.forEach { item ->
                 Row(
                     modifier = Modifier
@@ -228,14 +238,68 @@ fun PartnerOrderCard(order: PartnerOrder) {
             Divider()
             Spacer(Modifier.height(12.dp))
 
-            // Customer and Location Info
+            // Customer Info with Contact Actions
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     InfoRow(label = "Customer:", value = order.userName)
                     InfoRow(label = "Location:", value = order.userSubLocation)
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.padding(vertical = 2.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.Phone,
+                            contentDescription = "Phone",
+                            modifier = Modifier.size(16.dp),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            order.userPhone,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+
+                // Contact Action Buttons
+                Row {
+                    IconButton(onClick = {
+                        val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:${order.userPhone}"))
+                        context.startActivity(intent)
+                    }) {
+                        Icon(
+                            Icons.Default.Call,
+                            contentDescription = "Call Customer",
+                            tint = MaterialTheme.colorScheme.primary
+                        )
+                    }
+
+                    IconButton(onClick = {
+                        try {
+                            var formattedNumber = order.userPhone.replace(Regex("[^0-9+]"), "")
+                            if (formattedNumber.startsWith("01") && formattedNumber.length == 11) {
+                                formattedNumber = "+880${formattedNumber.substring(1)}"
+                            }
+                            val intent = Intent(Intent.ACTION_VIEW).apply {
+                                data = Uri.parse("https://api.whatsapp.com/send?phone=$formattedNumber")
+                                setPackage("com.whatsapp")
+                            }
+                            context.startActivity(intent)
+                        } catch (e: Exception) {
+                            Toast.makeText(context, "WhatsApp is not installed.", Toast.LENGTH_SHORT).show()
+                        }
+                    }) {
+                        Icon(
+                            Icons.Default.Chat,
+                            contentDescription = "WhatsApp Customer",
+                            tint = Color(0xFF25D366)
+                        )
+                    }
                 }
             }
 
@@ -264,6 +328,48 @@ fun PartnerOrderCard(order: PartnerOrder) {
                         fontWeight = FontWeight.Bold,
                         style = MaterialTheme.typography.titleMedium
                     )
+                }
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            // Partner Status Action Buttons
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                OutlinedButton(
+                    onClick = {
+                        kotlinx.coroutines.MainScope().launch {
+                            updatePartnerStatus(order.id, "Accepted")
+                        }
+                    },
+                    modifier = Modifier.weight(1f),
+                    enabled = !isUpdating
+                ) {
+                    if (isUpdating) {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp))
+                    } else {
+                        Text("Accept")
+                    }
+                }
+                Button(
+                    onClick = {
+                        kotlinx.coroutines.MainScope().launch {
+                            updatePartnerStatus(order.id, "Ready")
+                        }
+                    },
+                    modifier = Modifier.weight(1f),
+                    enabled = !isUpdating
+                ) {
+                    if (isUpdating) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(16.dp),
+                            color = MaterialTheme.colorScheme.onPrimary
+                        )
+                    } else {
+                        Text("Ready")
+                    }
                 }
             }
         }

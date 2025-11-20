@@ -150,6 +150,9 @@ fun DeliveryHistoryScreen(
     val totalEarnings = filteredOrders.sumOf { partnerOrder ->
         partnerOrder.items.sumOf { item -> item.price * item.quantity }
     }
+    val totalItems = filteredOrders.sumOf { partnerOrder ->
+        partnerOrder.items.sumOf { item -> item.quantity }
+    }
 
     Scaffold(
         topBar = {
@@ -211,7 +214,8 @@ fun DeliveryHistoryScreen(
             else {
                 SummaryCard(
                     totalDeliveries = totalDeliveries,
-                    totalEarnings = totalEarnings
+                    totalEarnings = totalEarnings,
+                    totalItems = totalItems
                 )
                 Spacer(modifier = Modifier.height(16.dp))
 
@@ -236,7 +240,7 @@ fun DeliveryHistoryScreen(
 }
 
 @Composable
-fun SummaryCard(totalDeliveries: Int, totalEarnings: Double) {
+fun SummaryCard(totalDeliveries: Int, totalEarnings: Double, totalItems: Int) {
     Card(
         modifier = Modifier.fillMaxWidth(),
         elevation = CardDefaults.cardElevation(2.dp),
@@ -258,6 +262,19 @@ fun SummaryCard(totalDeliveries: Int, totalEarnings: Double) {
                     text = totalDeliveries.toString(),
                     style = MaterialTheme.typography.headlineMedium,
                     fontWeight = FontWeight.Bold
+                )
+            }
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(
+                    text = "Total Items",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Text(
+                    text = totalItems.toString(),
+                    style = MaterialTheme.typography.headlineMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.secondary
                 )
             }
             Column(horizontalAlignment = Alignment.CenterHorizontally) {

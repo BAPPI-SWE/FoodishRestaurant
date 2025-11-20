@@ -17,6 +17,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -135,6 +136,7 @@ fun PartnerOrderCard(order: PartnerOrder, partnerName: String) {
     val sdf = remember { SimpleDateFormat("dd MMM, hh:mm a", Locale.getDefault()) }
     val context = LocalContext.current
     var isUpdating by remember { mutableStateOf(false) }
+    var currentPartnerStatus by remember { mutableStateOf<String?>(null) }
 
     val statusColor = when (order.orderStatus) {
         "Pending" -> Color(0xFF757575)
@@ -164,6 +166,7 @@ fun PartnerOrderCard(order: PartnerOrder, partnerName: String) {
             }
 
             orderRef.update("items", updatedItems).await()
+            currentPartnerStatus = newStatus
             Toast.makeText(context, "Status updated to $newStatus", Toast.LENGTH_SHORT).show()
         } catch (e: Exception) {
             Toast.makeText(context, "Failed to update: ${e.message}", Toast.LENGTH_SHORT).show()
@@ -194,13 +197,13 @@ fun PartnerOrderCard(order: PartnerOrder, partnerName: String) {
                         color = Color.Gray
                     )
                 }
-                Text(
-                    "৳${order.totalPrice}",
-                    style = MaterialTheme.typography.titleLarge,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.align(Alignment.CenterVertically)
-                )
+//                Text(
+//                    "৳${order.totalPrice}",
+//                    style = MaterialTheme.typography.titleLarge,
+//                    fontWeight = FontWeight.Bold,
+//                    color = MaterialTheme.colorScheme.primary,
+//                    modifier = Modifier.align(Alignment.CenterVertically)
+//                )
             }
 
             Spacer(Modifier.height(12.dp))
@@ -344,10 +347,10 @@ fun PartnerOrderCard(order: PartnerOrder, partnerName: String) {
                             updatePartnerStatus(order.id, "Accepted")
                         }
                     },
-                    modifier = Modifier.weight(1f),
-                    enabled = !isUpdating
+                    modifier = Modifier.weight(1f).alpha(if (currentPartnerStatus == "Accepted" || currentPartnerStatus == "Ready") 0.4f else 1f),
+                    enabled = !isUpdating && currentPartnerStatus != "Accepted" && currentPartnerStatus != "Ready"
                 ) {
-                    if (isUpdating) {
+                    if (isUpdating && currentPartnerStatus != "Ready") {
                         CircularProgressIndicator(modifier = Modifier.size(16.dp))
                     } else {
                         Text("Accept")
@@ -359,10 +362,10 @@ fun PartnerOrderCard(order: PartnerOrder, partnerName: String) {
                             updatePartnerStatus(order.id, "Ready")
                         }
                     },
-                    modifier = Modifier.weight(1f),
-                    enabled = !isUpdating
+                    modifier = Modifier.weight(1f).alpha(if (currentPartnerStatus == "Ready") 0.4f else 1f),
+                    enabled = !isUpdating && currentPartnerStatus != "Ready"
                 ) {
-                    if (isUpdating) {
+                    if (isUpdating && currentPartnerStatus == null) {
                         CircularProgressIndicator(
                             modifier = Modifier.size(16.dp),
                             color = MaterialTheme.colorScheme.onPrimary

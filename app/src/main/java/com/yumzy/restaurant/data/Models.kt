@@ -52,7 +52,8 @@ data class OrderItemDetail(
     val name: String = "",
     val quantity: Int = 0,
     val price: Double = 0.0,
-    val miniResName: String = "" // We need this to filter!
+    val miniResName: String = "", // We need this to filter!
+    val partnerStatus: String? = null  // ADD THIS
 )
 
 /**

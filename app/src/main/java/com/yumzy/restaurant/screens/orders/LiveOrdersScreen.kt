@@ -22,7 +22,6 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.ktx.firestore
 import com.google.firebase.ktx.Firebase
 import com.yumzy.restaurant.data.MiniRestaurant
@@ -38,53 +37,70 @@ import java.util.*
 fun LiveOrdersScreen(loggedInRestaurant: MiniRestaurant) {
     var partnerOrders by remember { mutableStateOf<List<PartnerOrder>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
 
     LaunchedEffect(loggedInRestaurant.name) {
         val db = Firebase.firestore
-        val listener = db.collection("orders")
+        // FIX 1: Trim the partner name once here to avoid repeated trimming
+        val partnerName = loggedInRestaurant.name?.trim() ?: ""
+
+        if (partnerName.isEmpty()) {
+            errorMessage = "Restaurant name is missing. Please re-login."
+            isLoading = false
+            return@LaunchedEffect
+        }
+
+        db.collection("orders")
             .whereIn("orderStatus", listOf("Pending", "Accepted", "Preparing", "On the way"))
             .limit(50)
             .addSnapshotListener { snapshot, error ->
                 if (error != null) {
+                    errorMessage = "Error loading orders: ${error.message}"
                     isLoading = false
                     return@addSnapshotListener
                 }
 
                 if (snapshot != null) {
                     val newPartnerOrders = mutableListOf<PartnerOrder>()
-                    val partnerName = loggedInRestaurant.name
 
                     for (doc in snapshot.documents) {
-                        val allItems = doc.get("items") as? List<Map<String, Any>> ?: emptyList()
+                        try {
+                            val allItems = doc.get("items") as? List<Map<String, Any>> ?: emptyList()
 
-                        val partnerItems = allItems.mapNotNull { itemMap ->
-                            val itemMiniResName = itemMap["miniResName"] as? String ?: ""
-                            val cleanPartnerName = partnerName?.trim()
-                            val cleanItemResName = itemMiniResName.trim()
+                            // FIX 2: Carry partnerStatus from Firestore into OrderItemDetail
+                            val partnerItems = allItems.mapNotNull { itemMap ->
+                                val itemMiniResName = (itemMap["miniResName"] as? String)?.trim() ?: ""
 
-                            if (!cleanPartnerName.isNullOrBlank() && cleanItemResName.isNotEmpty() && cleanItemResName.equals(cleanPartnerName, ignoreCase = true)) {
-                                OrderItemDetail(
-                                    name = itemMap["itemName"] as? String ?: "Unknown",
-                                    quantity = (itemMap["quantity"] as? Number)?.toInt() ?: 0,
-                                    price = (itemMap["price"] as? Number)?.toDouble() ?: 0.0,
-                                    miniResName = itemMiniResName
+                                if (itemMiniResName.equals(partnerName, ignoreCase = true)) {
+                                    OrderItemDetail(
+                                        name = itemMap["itemName"] as? String ?: "Unknown",
+                                        quantity = (itemMap["quantity"] as? Number)?.toInt() ?: 0,
+                                        price = (itemMap["price"] as? Number)?.toDouble() ?: 0.0,
+                                        miniResName = itemMiniResName,
+                                        // FIX 3: Read partnerStatus from Firestore so button state persists
+                                        partnerStatus = itemMap["partnerStatus"] as? String
+                                    )
+                                } else {
+                                    null
+                                }
+                            }
+
+                            if (partnerItems.isNotEmpty()) {
+                                val order = doc.toObject(PartnerOrder::class.java)?.copy(
+                                    id = doc.id,
+                                    items = partnerItems
                                 )
-                            } else {
-                                null
+                                if (order != null) {
+                                    newPartnerOrders.add(order)
+                                }
                             }
-                        }
-
-                        if (partnerItems.isNotEmpty()) {
-                            val order = doc.toObject(PartnerOrder::class.java)?.copy(
-                                id = doc.id,
-                                items = partnerItems
-                            )
-                            if (order != null) {
-                                newPartnerOrders.add(order)
-                            }
+                        } catch (e: Exception) {
+                            // Skip malformed documents silently
                         }
                     }
+
                     partnerOrders = newPartnerOrders.sortedByDescending { it.createdAt }
+                    errorMessage = null
                 }
                 isLoading = false
             }
@@ -102,28 +118,41 @@ fun LiveOrdersScreen(loggedInRestaurant: MiniRestaurant) {
                 .fillMaxSize()
                 .padding(paddingValues)
         ) {
-            if (isLoading) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator()
-                }
-            } else if (partnerOrders.isEmpty()) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Icon(Icons.Default.Storefront, "No orders", Modifier.size(64.dp), tint = Color.Gray)
-                        Spacer(Modifier.height(16.dp))
-                        Text("No active orders for your store right now.", color = Color.Gray)
+            when {
+                isLoading -> {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        CircularProgressIndicator()
                     }
                 }
-            } else {
-                LazyColumn(
-                    contentPadding = PaddingValues(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    items(partnerOrders) { order ->
-                        PartnerOrderCard(
-                            order = order,
-                            partnerName = loggedInRestaurant.name ?: ""
+                errorMessage != null -> {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Text(
+                            errorMessage ?: "Unknown error",
+                            color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.padding(16.dp)
                         )
+                    }
+                }
+                partnerOrders.isEmpty() -> {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                            Icon(Icons.Default.Storefront, "No orders", Modifier.size(64.dp), tint = Color.Gray)
+                            Spacer(Modifier.height(16.dp))
+                            Text("No active orders for your store right now.", color = Color.Gray)
+                        }
+                    }
+                }
+                else -> {
+                    LazyColumn(
+                        contentPadding = PaddingValues(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        items(partnerOrders, key = { it.id }) { order ->
+                            PartnerOrderCard(
+                                order = order,
+                                partnerName = loggedInRestaurant.name ?: ""
+                            )
+                        }
                     }
                 }
             }
@@ -136,7 +165,12 @@ fun PartnerOrderCard(order: PartnerOrder, partnerName: String) {
     val sdf = remember { SimpleDateFormat("dd MMM, hh:mm a", Locale.getDefault()) }
     val context = LocalContext.current
     var isUpdating by remember { mutableStateOf(false) }
-    var currentPartnerStatus by remember { mutableStateOf<String?>(null) }
+
+    // FIX 4: Initialize button state from Firestore data (partnerStatus on the item),
+    // not from local remember that resets to null on every recomposition/navigation.
+    var currentPartnerStatus by remember(order.id) {
+        mutableStateOf(order.items.firstOrNull()?.partnerStatus)
+    }
 
     val statusColor = when (order.orderStatus) {
         "Pending" -> Color(0xFF757575)
@@ -157,9 +191,7 @@ fun PartnerOrderCard(order: PartnerOrder, partnerName: String) {
             val updatedItems = items.map { item ->
                 val itemMiniResName = item["miniResName"] as? String ?: ""
                 if (itemMiniResName.trim().equals(partnerName.trim(), ignoreCase = true)) {
-                    item.toMutableMap().apply {
-                        put("partnerStatus", newStatus)
-                    }
+                    item.toMutableMap().apply { put("partnerStatus", newStatus) }
                 } else {
                     item
                 }
@@ -175,12 +207,16 @@ fun PartnerOrderCard(order: PartnerOrder, partnerName: String) {
         }
     }
 
+    val scope = rememberCoroutineScope()
+
     Card(
         modifier = Modifier.fillMaxWidth(),
         elevation = CardDefaults.cardElevation(3.dp),
         shape = RoundedCornerShape(12.dp)
     ) {
         Column(Modifier.padding(16.dp)) {
+
+            // Order Header
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.Top
@@ -191,37 +227,32 @@ fun PartnerOrderCard(order: PartnerOrder, partnerName: String) {
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.Bold
                     )
+                    Spacer(Modifier.height(4.dp))
                     Text(
-                        sdf.format(order.createdAt.toDate()),
+                        sdf.format(order.createdAt?.toDate() ?: Date()),
                         style = MaterialTheme.typography.bodySmall,
                         color = Color.Gray
                     )
                 }
-//                Text(
-//                    "৳${order.totalPrice}",
-//                    style = MaterialTheme.typography.titleLarge,
-//                    fontWeight = FontWeight.Bold,
-//                    color = MaterialTheme.colorScheme.primary,
-//                    modifier = Modifier.align(Alignment.CenterVertically)
-//                )
+                Text(
+                    "৳${order.items.sumOf { it.price * it.quantity }}",
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = MaterialTheme.colorScheme.primary
+                )
             }
 
             Spacer(Modifier.height(12.dp))
             Divider()
             Spacer(Modifier.height(12.dp))
 
-            Text(
-                "Your Items:",
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.SemiBold
-            )
+            // Items
+            Text("Your Items:", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(4.dp))
 
             order.items.forEach { item ->
                 Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(vertical = 2.dp),
+                    modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(
@@ -241,7 +272,7 @@ fun PartnerOrderCard(order: PartnerOrder, partnerName: String) {
             Divider()
             Spacer(Modifier.height(12.dp))
 
-            // Customer Info with Contact Actions
+            // Customer Info
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -269,19 +300,13 @@ fun PartnerOrderCard(order: PartnerOrder, partnerName: String) {
                     }
                 }
 
-                // Contact Action Buttons
                 Row {
                     IconButton(onClick = {
                         val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:${order.userPhone}"))
                         context.startActivity(intent)
                     }) {
-                        Icon(
-                            Icons.Default.Call,
-                            contentDescription = "Call Customer",
-                            tint = MaterialTheme.colorScheme.primary
-                        )
+                        Icon(Icons.Default.Call, contentDescription = "Call Customer", tint = MaterialTheme.colorScheme.primary)
                     }
-
                     IconButton(onClick = {
                         try {
                             var formattedNumber = order.userPhone.replace(Regex("[^0-9+]"), "")
@@ -297,18 +322,14 @@ fun PartnerOrderCard(order: PartnerOrder, partnerName: String) {
                             Toast.makeText(context, "WhatsApp is not installed.", Toast.LENGTH_SHORT).show()
                         }
                     }) {
-                        Icon(
-                            Icons.Default.Chat,
-                            contentDescription = "WhatsApp Customer",
-                            tint = Color(0xFF25D366)
-                        )
+                        Icon(Icons.Default.Chat, contentDescription = "WhatsApp Customer", tint = Color(0xFF25D366))
                     }
                 }
             }
 
             Spacer(Modifier.height(12.dp))
 
-            // Status Badge
+            // Order Status Badge
             Surface(
                 shape = RoundedCornerShape(8.dp),
                 color = statusColor.copy(alpha = 0.15f),
@@ -319,11 +340,7 @@ fun PartnerOrderCard(order: PartnerOrder, partnerName: String) {
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.Center
                 ) {
-                    Box(
-                        modifier = Modifier
-                            .size(10.dp)
-                            .background(statusColor, RoundedCornerShape(50))
-                    )
+                    Box(modifier = Modifier.size(10.dp).background(statusColor, RoundedCornerShape(50)))
                     Spacer(Modifier.width(8.dp))
                     Text(
                         text = order.orderStatus,
@@ -336,42 +353,41 @@ fun PartnerOrderCard(order: PartnerOrder, partnerName: String) {
 
             Spacer(Modifier.height(12.dp))
 
-            // Partner Status Action Buttons
+            // FIX 5: Partner Status Action Buttons — visually reflect current state clearly
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(12.dp)
             ) {
+                val acceptDone = currentPartnerStatus == "Accepted" || currentPartnerStatus == "Ready"
+                val readyDone = currentPartnerStatus == "Ready"
+
                 OutlinedButton(
-                    onClick = {
-                        kotlinx.coroutines.MainScope().launch {
-                            updatePartnerStatus(order.id, "Accepted")
-                        }
-                    },
-                    modifier = Modifier.weight(1f).alpha(if (currentPartnerStatus == "Accepted" || currentPartnerStatus == "Ready") 0.4f else 1f),
-                    enabled = !isUpdating && currentPartnerStatus != "Accepted" && currentPartnerStatus != "Ready"
-                ) {
-                    if (isUpdating && currentPartnerStatus != "Ready") {
-                        CircularProgressIndicator(modifier = Modifier.size(16.dp))
-                    } else {
-                        Text("Accept")
-                    }
-                }
-                Button(
-                    onClick = {
-                        kotlinx.coroutines.MainScope().launch {
-                            updatePartnerStatus(order.id, "Ready")
-                        }
-                    },
-                    modifier = Modifier.weight(1f).alpha(if (currentPartnerStatus == "Ready") 0.4f else 1f),
-                    enabled = !isUpdating && currentPartnerStatus != "Ready"
+                    onClick = { scope.launch { updatePartnerStatus(order.id, "Accepted") } },
+                    modifier = Modifier.weight(1f),
+                    enabled = !isUpdating && !acceptDone,
+                    colors = if (acceptDone) ButtonDefaults.outlinedButtonColors(
+                        containerColor = Color(0xFF0D47A1).copy(alpha = 0.1f)
+                    ) else ButtonDefaults.outlinedButtonColors()
                 ) {
                     if (isUpdating && currentPartnerStatus == null) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(16.dp),
-                            color = MaterialTheme.colorScheme.onPrimary
-                        )
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp))
                     } else {
-                        Text("Ready")
+                        Text(if (acceptDone) "✓ Accepted" else "Accept")
+                    }
+                }
+
+                Button(
+                    onClick = { scope.launch { updatePartnerStatus(order.id, "Ready") } },
+                    modifier = Modifier.weight(1f),
+                    enabled = !isUpdating && !readyDone,
+                    colors = if (readyDone) ButtonDefaults.buttonColors(
+                        containerColor = Color(0xFF2E7D32)
+                    ) else ButtonDefaults.buttonColors()
+                ) {
+                    if (isUpdating && currentPartnerStatus == "Accepted") {
+                        CircularProgressIndicator(modifier = Modifier.size(16.dp), color = MaterialTheme.colorScheme.onPrimary)
+                    } else {
+                        Text(if (readyDone) "✓ Ready" else "Ready")
                     }
                 }
             }

@@ -1,5 +1,6 @@
 package com.yumzy.restaurant
 
+import android.app.NotificationManager
 import android.media.MediaPlayer
 import android.media.RingtoneManager
 import android.os.Build
@@ -25,8 +26,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.lifecycleScope
+import com.google.firebase.firestore.ktx.firestore
+import com.google.firebase.ktx.Firebase
 import com.yumzy.restaurant.ui.theme.YumzyRestaurantTheme
-import com.yumzy.restaurant.utils.OrderAlertTracker
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
 
 class OrderAlarmActivity : ComponentActivity() {
 
@@ -35,7 +40,6 @@ class OrderAlarmActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Make it show over lock screen
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
             setShowWhenLocked(true)
             setTurnScreenOn(true)
@@ -47,7 +51,6 @@ class OrderAlarmActivity : ComponentActivity() {
             )
         }
 
-        // Get order details from intent
         val orderId = intent.getStringExtra("ORDER_ID") ?: "Unknown"
         val customerName = intent.getStringExtra("CUSTOMER_NAME") ?: "Customer"
         val itemCount = intent.getIntExtra("ITEM_COUNT", 0)
@@ -55,11 +58,10 @@ class OrderAlarmActivity : ComponentActivity() {
         val itemNames = intent.getStringExtra("ITEM_NAMES") ?: ""
         val userSubLocation = intent.getStringExtra("USER_SUB_LOCATION") ?: ""
         val userPhone = intent.getStringExtra("USER_PHONE") ?: ""
-        // "new" -> brand-new order alert. "cancel" -> customer cancelled an order.
+        val notificationId = intent.getIntExtra("NOTIFICATION_ID", -1)
         val type = intent.getStringExtra("TYPE") ?: "new"
         val isCancel = type == "cancel"
 
-        // Start playing alarm sound
         startAlarmSound()
 
         setContent {
@@ -75,21 +77,62 @@ class OrderAlarmActivity : ComponentActivity() {
                     userPhone = userPhone,
                     onDismiss = {
                         stopAlarmSound()
-                        if (isCancel) {
-                            // "Undo" rule: if the partner had NOT yet marked this order
-                            // Accepted/Ready when it got cancelled, there's nothing to keep a
-                            // record of - clear it immediately so it never lingers in the
-                            // Live Orders list. If they HAD already progressed it, the meta
-                            // (and hadProgress flag) recorded by the listener is left as-is,
-                            // so it stays visible for the 10 minute grace period.
-                            val meta = OrderAlertTracker.getCancelMeta(this, orderId)
-                            if (meta != null && !meta.hadProgress) {
-                                OrderAlertTracker.clearCancelMeta(this, orderId)
-                            }
+
+                        // FIX: this is what was missing before - dismissing the popup used to
+                        // only stop the MediaPlayer, leaving the notification (and whatever
+                        // sound/vibration is tied to it) alive in the tray until manually
+                        // tapped. Cancelling it here means one tap fully clears the alert.
+                        if (notificationId != -1) {
+                            val manager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                            manager.cancel(notificationId)
                         }
+
+                        if (isCancel) {
+                            // Requirement: acknowledging a cancellation should clear any
+                            // Accepted/Ready status this restaurant had already set on the
+                            // order's items in Firestore, since the order no longer needs it.
+                            clearPartnerStatusInFirestore(orderId)
+                        }
+
                         finish()
                     }
                 )
+            }
+        }
+    }
+
+    /** Removes the "partnerStatus" field from this restaurant's items on a cancelled order. */
+    private fun clearPartnerStatusInFirestore(orderId: String) {
+        val prefs = getSharedPreferences("YumzyPartnerPrefs", MODE_PRIVATE)
+        val partnerName = prefs.getString("res_name", null)
+            ?.trim()?.replace(Regex("\\s+"), " ") ?: return
+
+        lifecycleScope.launch {
+            try {
+                val db = Firebase.firestore
+                val orderRef = db.collection("orders").document(orderId)
+                val orderDoc = orderRef.get().await()
+                val items = orderDoc.get("items") as? List<Map<String, Any>> ?: return@launch
+
+                var changed = false
+                val updatedItems = items.map { item ->
+                    val itemMiniResName = (item["miniResName"] as? String)
+                        ?.trim()?.replace(Regex("\\s+"), " ") ?: ""
+                    if (itemMiniResName.equals(partnerName, ignoreCase = true) &&
+                        item.containsKey("partnerStatus")
+                    ) {
+                        changed = true
+                        item.toMutableMap().apply { remove("partnerStatus") }
+                    } else {
+                        item
+                    }
+                }
+
+                if (changed) {
+                    orderRef.update("items", updatedItems).await()
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
             }
         }
     }
@@ -100,7 +143,7 @@ class OrderAlarmActivity : ComponentActivity() {
                 ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE)
 
             mediaPlayer = MediaPlayer.create(this, alarmUri).apply {
-                isLooping = true // Loop the sound
+                isLooping = true
                 start()
             }
         } catch (e: Exception) {
@@ -125,8 +168,8 @@ class OrderAlarmActivity : ComponentActivity() {
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
-        // Prevent back button from dismissing without stopping alarm
-        // User must click the dismiss button
+        // Prevent back button from dismissing without stopping alarm.
+        // User must click the dismiss button.
     }
 }
 
@@ -142,7 +185,11 @@ fun OrderAlarmScreen(
     userPhone: String,
     onDismiss: () -> Unit
 ) {
-    val accentColor = if (isCancel) Color(0xFFB71C1C) else MaterialTheme.colorScheme.error
+    // New order = green. Cancelled order = red. Requested explicitly so the two alert types
+    // are unmistakably different at a glance, especially in a dark full-screen popup.
+    val accentColor = if (isCancel) Color(0xFFC62828) else Color(0xFF2E7D32)
+    val containerColor = if (isCancel) Color(0xFFFDEAEA) else Color(0xFFE8F5E9)
+    val onContainerColor = Color(0xFF212121)
     val icon: ImageVector = if (isCancel) Icons.Default.Cancel else Icons.Default.Notifications
     val title = if (isCancel) "ORDER CANCELLED!" else "NEW ORDER!"
     val buttonLabel = if (isCancel) "OK, CANCEL" else "GOT IT - STOP ALARM"
@@ -158,9 +205,7 @@ fun OrderAlarmScreen(
                 .fillMaxWidth(0.9f)
                 .wrapContentHeight(),
             shape = RoundedCornerShape(20.dp),
-            colors = CardDefaults.cardColors(
-                containerColor = MaterialTheme.colorScheme.errorContainer
-            )
+            colors = CardDefaults.cardColors(containerColor = containerColor)
         ) {
             Column(
                 modifier = Modifier
@@ -171,7 +216,6 @@ fun OrderAlarmScreen(
                 horizontalAlignment = Alignment.CenterHorizontally,
                 verticalArrangement = Arrangement.spacedBy(20.dp)
             ) {
-                // Icon
                 Icon(
                     imageVector = icon,
                     contentDescription = title,
@@ -179,7 +223,6 @@ fun OrderAlarmScreen(
                     tint = accentColor
                 )
 
-                // Title
                 Text(
                     text = title,
                     style = MaterialTheme.typography.headlineLarge,
@@ -188,9 +231,8 @@ fun OrderAlarmScreen(
                     textAlign = TextAlign.Center
                 )
 
-                Divider(color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.3f))
+                Divider(color = onContainerColor.copy(alpha = 0.15f))
 
-                // Order Details
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(12.dp)
@@ -198,20 +240,21 @@ fun OrderAlarmScreen(
                     Text(
                         text = "Order #${orderId.take(6)}",
                         style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.SemiBold
+                        fontWeight = FontWeight.SemiBold,
+                        color = onContainerColor
                     )
 
                     Text(
                         text = customerName,
                         style = MaterialTheme.typography.titleMedium,
-                        color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.8f)
+                        color = onContainerColor.copy(alpha = 0.8f)
                     )
 
                     if (userSubLocation.isNotBlank()) {
                         Text(
                             text = userSubLocation,
                             style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.7f)
+                            color = onContainerColor.copy(alpha = 0.7f)
                         )
                     }
 
@@ -219,19 +262,20 @@ fun OrderAlarmScreen(
                         Text(
                             text = userPhone,
                             style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.7f)
+                            color = onContainerColor.copy(alpha = 0.7f)
                         )
                     }
 
                     Surface(
                         shape = RoundedCornerShape(12.dp),
-                        color = accentColor.copy(alpha = 0.2f)
+                        color = accentColor.copy(alpha = 0.15f)
                     ) {
                         Text(
                             text = "$itemCount item(s)",
                             modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
                             style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.Bold
+                            fontWeight = FontWeight.Bold,
+                            color = onContainerColor
                         )
                     }
 
@@ -240,42 +284,40 @@ fun OrderAlarmScreen(
                             text = itemNames,
                             style = MaterialTheme.typography.bodyMedium,
                             textAlign = TextAlign.Center,
-                            color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.9f)
+                            color = onContainerColor.copy(alpha = 0.9f)
                         )
                     }
 
                     Text(
                         text = if (isCancel) "This order was cancelled by the customer." else "Status: $orderStatus",
                         style = MaterialTheme.typography.bodyLarge,
-                        color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.7f),
+                        color = onContainerColor.copy(alpha = 0.7f),
                         textAlign = TextAlign.Center
                     )
                 }
 
                 Spacer(modifier = Modifier.height(8.dp))
 
-                // Dismiss Button
                 Button(
                     onClick = onDismiss,
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(56.dp),
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = accentColor
-                    ),
+                    colors = ButtonDefaults.buttonColors(containerColor = accentColor),
                     shape = RoundedCornerShape(12.dp)
                 ) {
                     Text(
                         text = buttonLabel,
                         fontSize = 18.sp,
-                        fontWeight = FontWeight.Bold
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White
                     )
                 }
 
                 Text(
                     text = if (isCancel) "Tap to stop alarm and acknowledge" else "Tap to stop alarm and view order",
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.6f),
+                    color = onContainerColor.copy(alpha = 0.6f),
                     textAlign = TextAlign.Center
                 )
             }

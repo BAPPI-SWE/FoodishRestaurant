@@ -1,6 +1,5 @@
 package com.yumzy.restaurant.screens.orders
 
-import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.widget.Toast
@@ -23,13 +22,11 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.google.firebase.firestore.DocumentChange
 import com.google.firebase.firestore.DocumentSnapshot
 import com.google.firebase.firestore.ListenerRegistration
 import com.google.firebase.firestore.Query
 import com.google.firebase.firestore.ktx.firestore
 import com.google.firebase.ktx.Firebase
-import com.yumzy.restaurant.OrderAlarmActivity
 import com.yumzy.restaurant.data.MiniRestaurant
 import com.yumzy.restaurant.data.OrderItemDetail
 import com.yumzy.restaurant.data.PartnerOrder
@@ -40,9 +37,14 @@ import kotlinx.coroutines.tasks.await
 import java.text.SimpleDateFormat
 import java.util.*
 
-private val ACTIVE_STATUSES = listOf("Pending", "Accepted", "Preparing", "On the way")
-private val WATCHED_STATUSES = ACTIVE_STATUSES + "Cancelled"
+private val WATCHED_STATUSES = listOf("Pending", "Accepted", "Preparing", "On the way", "Cancelled")
 
+/**
+ * NOTE: This screen ONLY displays orders - it does not trigger alarms/notifications. That is
+ * OrderMonitorService's job exclusively (see the note at the top of that file). Having two
+ * independent listeners both alarm off the same events was what caused two overlapping alarm
+ * sounds; this screen's listener now purely renders whatever Firestore currently has.
+ */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LiveOrdersScreen(loggedInRestaurant: MiniRestaurant) {
@@ -53,7 +55,7 @@ fun LiveOrdersScreen(loggedInRestaurant: MiniRestaurant) {
     val context = LocalContext.current
 
     // Re-evaluated periodically so a cancelled order silently drops off the list once its
-    // 10-minute grace period elapses, even if no new Firestore snapshot arrives in the meantime.
+    // 10-minute grace period elapses, even with no new Firestore snapshot in the meantime.
     var nowTick by remember { mutableStateOf(System.currentTimeMillis()) }
     LaunchedEffect(Unit) {
         while (true) {
@@ -62,12 +64,9 @@ fun LiveOrdersScreen(loggedInRestaurant: MiniRestaurant) {
         }
     }
 
-    // FIX: previous version never removed its snapshot listener, so navigating away and back
-    // (or restaurant name changing) piled up duplicate listeners. DisposableEffect + explicit
-    // remove() fixes that leak.
     DisposableEffect(loggedInRestaurant.name) {
         val db = Firebase.firestore
-        val partnerName = loggedInRestaurant.name?.trim() ?: ""
+        val partnerName = loggedInRestaurant.name?.trim()?.replace(Regex("\\s+"), " ") ?: ""
         var registration: ListenerRegistration? = null
 
         if (partnerName.isEmpty()) {
@@ -78,16 +77,11 @@ fun LiveOrdersScreen(loggedInRestaurant: MiniRestaurant) {
                 return try {
                     val allItems = doc.get("items") as? List<Map<String, Any>> ?: emptyList()
 
-                    // FIX: normalize whitespace (not just trim) before comparing names, so a
-                    // stray double-space or non-breaking space in either the order item or the
-                    // restaurant's saved name doesn't silently hide an order from the partner.
-                    val normalizedPartner = partnerName.replace(Regex("\\s+"), " ")
-
                     val partnerItems = allItems.mapNotNull { itemMap ->
                         val rawName = (itemMap["miniResName"] as? String) ?: ""
                         val normalizedItem = rawName.trim().replace(Regex("\\s+"), " ")
 
-                        if (normalizedItem.isNotEmpty() && normalizedItem.equals(normalizedPartner, ignoreCase = true)) {
+                        if (normalizedItem.isNotEmpty() && normalizedItem.equals(partnerName, ignoreCase = true)) {
                             OrderItemDetail(
                                 name = itemMap["itemName"] as? String ?: "Unknown",
                                 quantity = (itemMap["quantity"] as? Number)?.toInt() ?: 0,
@@ -113,9 +107,6 @@ fun LiveOrdersScreen(loggedInRestaurant: MiniRestaurant) {
 
             registration = db.collection("orders")
                 .whereIn("orderStatus", WATCHED_STATUSES)
-                // FIX: orderBy + limit added. Without an orderBy, Firestore doesn't guarantee
-                // which documents a limit() keeps as the collection grows, which could quietly
-                // exclude a brand-new order from the results entirely.
                 .orderBy("createdAt", Query.Direction.DESCENDING)
                 .limit(100)
                 .addSnapshotListener { snapshot, error ->
@@ -129,49 +120,22 @@ fun LiveOrdersScreen(loggedInRestaurant: MiniRestaurant) {
                         return@addSnapshotListener
                     }
 
-                    // Fire alarms for anything genuinely new (deduped by OrderAlertTracker so
-                    // this never re-fires just because the listener restarted).
-                    for (dc in snapshot.documentChanges) {
-                        val order = extractPartnerOrder(dc.document) ?: continue
-                        val status = dc.document.getString("orderStatus") ?: continue
-
-                        if (status == "Cancelled") {
-                            if (!OrderAlertTracker.hasAlertedCancelledOrder(context, order.id)) {
-                                val hadProgress = order.items.any {
-                                    it.partnerStatus == "Accepted" || it.partnerStatus == "Ready"
-                                }
-                                OrderAlertTracker.recordCancelMeta(context, order.id, hadProgress)
-                                OrderAlertTracker.markCancelledOrderAlerted(context, order.id)
-                                launchOrderAlarm(context, order, type = "cancel")
-                            }
-                        } else if (dc.type == DocumentChange.Type.ADDED) {
-                            if (!OrderAlertTracker.hasAlertedNewOrder(context, order.id)) {
-                                OrderAlertTracker.markNewOrderAlerted(context, order.id)
-                                launchOrderAlarm(context, order, type = "new")
-                            }
-                        }
-                    }
-
-                    // Build the full display lists from the whole snapshot (not just the diff).
                     val allOrders = snapshot.documents.mapNotNull { extractPartnerOrder(it) }
 
                     activeOrders = allOrders
                         .filter { it.orderStatus != "Cancelled" }
                         .sortedByDescending { it.createdAt.toDate().time }
 
+                    // Show EVERY cancelled order for a 10-minute grace period - no other
+                    // condition. Prefer the synced Firestore cancelledObservedAt timestamp;
+                    // fall back to a local "first seen" stamp only for the brief moment before
+                    // that field has propagated back down from the server.
                     cancelledOrders = allOrders
                         .filter { it.orderStatus == "Cancelled" }
-                        .mapNotNull { order ->
-                            val meta = OrderAlertTracker.getCancelMeta(context, order.id)
-                                ?: OrderAlertTracker.recordCancelMeta(
-                                    context,
-                                    order.id,
-                                    order.items.any { i -> i.partnerStatus == "Accepted" || i.partnerStatus == "Ready" }
-                                )
-                            // "Undo" rule: if the order was cancelled before the partner ever
-                            // accepted/marked it ready, there's nothing to keep - don't show it.
-                            if (!meta.hadProgress) return@mapNotNull null
-                            order
+                        .filter { order ->
+                            val cancelledAtMillis = order.cancelledObservedAt?.toDate()?.time
+                                ?: OrderAlertTracker.getOrRecordFallbackCancelTimestamp(context, order.id)
+                            (System.currentTimeMillis() - cancelledAtMillis) <= OrderAlertTracker.CANCEL_GRACE_PERIOD_MS
                         }
                         .sortedByDescending { it.createdAt.toDate().time }
 
@@ -185,13 +149,14 @@ fun LiveOrdersScreen(loggedInRestaurant: MiniRestaurant) {
         }
     }
 
-    // Drop cancelled orders whose 10-minute grace period has expired, independent of whether
-    // a new snapshot has arrived.
+    // Re-filter against the periodic tick too, so an order disappears the instant its 10
+    // minutes are up even without a fresh snapshot arriving.
     val visibleCancelledOrders by remember(cancelledOrders, nowTick) {
         derivedStateOf {
             cancelledOrders.filter { order ->
-                val meta = OrderAlertTracker.getCancelMeta(context, order.id)
-                meta != null && (nowTick - meta.firstSeenAt) <= OrderAlertTracker.CANCEL_GRACE_PERIOD_MS
+                val cancelledAtMillis = order.cancelledObservedAt?.toDate()?.time
+                    ?: OrderAlertTracker.getOrRecordFallbackCancelTimestamp(context, order.id)
+                (nowTick - cancelledAtMillis) <= OrderAlertTracker.CANCEL_GRACE_PERIOD_MS
             }
         }
     }
@@ -258,10 +223,10 @@ fun LiveOrdersScreen(loggedInRestaurant: MiniRestaurant) {
                         }
 
                         items(visibleCancelledOrders, key = { "cancelled_${it.id}" }) { order ->
-                            val meta = OrderAlertTracker.getCancelMeta(context, order.id)
-                            val remainingMs = meta?.let {
-                                (OrderAlertTracker.CANCEL_GRACE_PERIOD_MS - (nowTick - it.firstSeenAt)).coerceAtLeast(0)
-                            } ?: 0
+                            val cancelledAtMillis = order.cancelledObservedAt?.toDate()?.time
+                                ?: OrderAlertTracker.getOrRecordFallbackCancelTimestamp(context, order.id)
+                            val remainingMs = (OrderAlertTracker.CANCEL_GRACE_PERIOD_MS - (nowTick - cancelledAtMillis))
+                                .coerceAtLeast(0)
                             PartnerOrderCard(
                                 order = order,
                                 partnerName = loggedInRestaurant.name ?: "",
@@ -276,22 +241,6 @@ fun LiveOrdersScreen(loggedInRestaurant: MiniRestaurant) {
     }
 }
 
-private fun launchOrderAlarm(context: Context, order: PartnerOrder, type: String) {
-    val itemNames = order.items.joinToString(", ") { "${it.quantity}x ${it.name}" }
-    val intent = Intent(context, OrderAlarmActivity::class.java).apply {
-        flags = Intent.FLAG_ACTIVITY_NEW_TASK
-        putExtra("TYPE", type)
-        putExtra("ORDER_ID", order.id)
-        putExtra("CUSTOMER_NAME", order.userName)
-        putExtra("ORDER_STATUS", order.orderStatus)
-        putExtra("ITEM_COUNT", order.items.sumOf { it.quantity })
-        putExtra("ITEM_NAMES", itemNames)
-        putExtra("USER_SUB_LOCATION", order.userSubLocation)
-        putExtra("USER_PHONE", order.userPhone)
-    }
-    context.startActivity(intent)
-}
-
 @Composable
 fun PartnerOrderCard(
     order: PartnerOrder,
@@ -304,8 +253,6 @@ fun PartnerOrderCard(
     var isUpdating by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
-    // Initialize button state from Firestore data (partnerStatus on the item), not from local
-    // remember that resets to null on every recomposition/navigation.
     var currentPartnerStatus by remember(order.id) {
         mutableStateOf(order.items.firstOrNull()?.partnerStatus)
     }
@@ -356,7 +303,6 @@ fun PartnerOrderCard(
     ) {
         Column(Modifier.padding(16.dp)) {
 
-            // Order Header
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.Top
@@ -386,7 +332,6 @@ fun PartnerOrderCard(
             Divider()
             Spacer(Modifier.height(12.dp))
 
-            // Items
             Text("Your Items:", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(4.dp))
 
@@ -412,7 +357,6 @@ fun PartnerOrderCard(
             Divider()
             Spacer(Modifier.height(12.dp))
 
-            // Customer Info
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -469,7 +413,6 @@ fun PartnerOrderCard(
 
             Spacer(Modifier.height(12.dp))
 
-            // Order Status Badge
             Surface(
                 shape = RoundedCornerShape(8.dp),
                 color = statusColor.copy(alpha = 0.15f),
@@ -518,7 +461,6 @@ fun PartnerOrderCard(
                 )
             }
 
-            // Action buttons are only relevant for orders that are still live.
             if (!isCancelled) {
                 Spacer(Modifier.height(12.dp))
 

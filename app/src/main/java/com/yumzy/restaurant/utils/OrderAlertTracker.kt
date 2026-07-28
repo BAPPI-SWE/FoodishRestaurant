@@ -3,34 +3,23 @@ package com.yumzy.restaurant.utils
 import android.content.Context
 
 /**
- * Lightweight, persistent tracker used by both OrderMonitorService (background) and
- * LiveOrdersScreen (foreground) so the two never fight or duplicate work.
+ * Lightweight, persistent tracker used by OrderMonitorService (the single source of truth for
+ * alarms - see note in that file) to make sure each order id only ever triggers ONE "new order"
+ * alarm and ONE "cancelled order" alarm, no matter how many times the Firestore listener
+ * restarts (Firestore replays the entire initial snapshot as ADDED events on every restart,
+ * which used to cause a flood of repeat alarms for already-active orders).
  *
- * It solves two concrete bugs:
- *
- * 1) THE "ALARM FLOOD" BUG
- *    Firestore's addSnapshotListener delivers the *entire initial snapshot* as a stream of
- *    DocumentChange.Type.ADDED events - not just genuinely new documents. The old code
- *    treated every ADDED event as "new order -> ring alarm", so every time the service
- *    restarted (Android killing/recreating it, phone reboot, app relaunch, etc.) it would
- *    replay a full-screen alarm for EVERY currently active order all at once. That flood is
- *    almost certainly why "new orders sometimes don't show properly" - overlapping alarm
- *    activities / a stuck MediaPlayer from a previous instance can swallow the next genuine
- *    alert. This tracker makes sure each order id only ever triggers one "new order" alarm
- *    and one "cancelled order" alarm, no matter how many times the listener restarts.
- *
- * 2) THE "CANCELLED ORDERS DISAPPEAR" REQUIREMENT
- *    The `orders` collection has no `cancelledAt` field we can query on, so we can't ask
- *    Firestore "show me orders cancelled in the last 10 minutes". Instead, the moment we
- *    *observe* an order flip to "Cancelled" we stamp it locally with the current time and
- *    whether the partner had already progressed it (Accepted/Ready). The UI then uses that
- *    stamp to keep it visible for a 10 minute grace period.
+ * It also holds a short-lived LOCAL FALLBACK timestamp for "when did this device first see this
+ * order as Cancelled" - used only for the few seconds/moments before Firestore's own
+ * `cancelledObservedAt` server timestamp (see Models.kt / PartnerOrder) has propagated back down
+ * to this device. Once that Firestore field is present, it is always treated as the source of
+ * truth for the 10-minute countdown - not this local fallback.
  */
 object OrderAlertTracker {
     private const val PREFS_NAME = "YumzyPartnerPrefs"
     private const val KEY_ALERTED_NEW = "alerted_new_order_ids"
     private const val KEY_ALERTED_CANCEL = "alerted_cancel_order_ids"
-    private const val KEY_CANCEL_META = "cancel_meta_entries" // encoded "orderId|timestamp|hadProgress"
+    private const val KEY_CANCEL_FALLBACK_TS = "cancel_fallback_timestamps" // "orderId|timestamp"
 
     const val CANCEL_GRACE_PERIOD_MS = 10 * 60 * 1000L // 10 minutes
 
@@ -61,47 +50,40 @@ object OrderAlertTracker {
         p.edit().putStringSet(KEY_ALERTED_CANCEL, current).apply()
     }
 
-    // ---------------- Cancellation metadata (first-seen time + progress flag) ----------------
+    // ---------------- Local fallback "first seen cancelled" timestamp ----------------
 
-    data class CancelMeta(val orderId: String, val firstSeenAt: Long, val hadProgress: Boolean)
-
-    private fun readAllMeta(context: Context): MutableList<CancelMeta> {
-        val raw = prefs(context).getStringSet(KEY_CANCEL_META, emptySet()) ?: emptySet()
-        return raw.mapNotNull { entry ->
+    private fun readFallbackTimestamps(context: Context): MutableMap<String, Long> {
+        val raw = prefs(context).getStringSet(KEY_CANCEL_FALLBACK_TS, emptySet()) ?: emptySet()
+        val map = mutableMapOf<String, Long>()
+        raw.forEach { entry ->
             val parts = entry.split("|")
-            if (parts.size != 3) return@mapNotNull null
-            val ts = parts[1].toLongOrNull() ?: return@mapNotNull null
-            CancelMeta(orderId = parts[0], firstSeenAt = ts, hadProgress = parts[2] == "1")
-        }.toMutableList()
+            if (parts.size == 2) {
+                val ts = parts[1].toLongOrNull()
+                if (ts != null) map[parts[0]] = ts
+            }
+        }
+        return map
     }
 
-    private fun writeAllMeta(context: Context, list: List<CancelMeta>) {
-        val encoded = list.map { "${it.orderId}|${it.firstSeenAt}|${if (it.hadProgress) "1" else "0"}" }.toSet()
-        prefs(context).edit().putStringSet(KEY_CANCEL_META, encoded).apply()
+    private fun writeFallbackTimestamps(context: Context, map: Map<String, Long>) {
+        val encoded = map.entries.map { "${it.key}|${it.value}" }.toSet()
+        prefs(context).edit().putStringSet(KEY_CANCEL_FALLBACK_TS, encoded).apply()
     }
 
-    fun getCancelMeta(context: Context, orderId: String): CancelMeta? =
-        readAllMeta(context).firstOrNull { it.orderId == orderId }
-
-    /** Records (once) the moment this order was first observed as Cancelled. Idempotent. */
-    fun recordCancelMeta(context: Context, orderId: String, hadProgress: Boolean): CancelMeta {
-        getCancelMeta(context, orderId)?.let { return it }
-        val meta = CancelMeta(orderId, System.currentTimeMillis(), hadProgress)
-        val list = readAllMeta(context)
-        list.add(meta)
-        writeAllMeta(context, list)
-        return meta
-    }
-
-    fun clearCancelMeta(context: Context, orderId: String) {
-        val list = readAllMeta(context).filterNot { it.orderId == orderId }
-        writeAllMeta(context, list)
-    }
-
-    /** Call occasionally (e.g. app start) to stop the pref set from growing forever. */
-    fun purgeExpiredCancelMeta(context: Context) {
+    /** Returns the existing fallback timestamp for this order, recording "now" the first time it's asked for. */
+    fun getOrRecordFallbackCancelTimestamp(context: Context, orderId: String): Long {
+        val map = readFallbackTimestamps(context)
+        map[orderId]?.let { return it }
         val now = System.currentTimeMillis()
-        val kept = readAllMeta(context).filter { now - it.firstSeenAt < CANCEL_GRACE_PERIOD_MS }
-        writeAllMeta(context, kept)
+        map[orderId] = now
+        writeFallbackTimestamps(context, map)
+        return now
+    }
+
+    /** Call occasionally (e.g. service start) to stop the pref set from growing forever. */
+    fun purgeExpiredFallbackTimestamps(context: Context) {
+        val now = System.currentTimeMillis()
+        val kept = readFallbackTimestamps(context).filter { now - it.value < CANCEL_GRACE_PERIOD_MS }
+        writeFallbackTimestamps(context, kept)
     }
 }

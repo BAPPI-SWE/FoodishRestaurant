@@ -60,6 +60,10 @@ data class OrderItemDetail(
  * A custom Order class for the partner.
  * It will only contain items relevant to this partner.
  * --- UPDATED: Added userPhone field ---
+ * --- UPDATED: Added cancelledObservedAt - a server timestamp stamped onto the order the
+ *     moment any partner app first observes orderStatus flip to "Cancelled". Firestore has no
+ *     built-in "when did this field change" record, so this is what lets every device show a
+ *     consistent, synced 10-minute countdown instead of each phone guessing locally. ---
  */
 data class PartnerOrder(
     val id: String = "",
@@ -69,5 +73,6 @@ data class PartnerOrder(
     val userPhone: String = "", // Added this field
     val totalPrice: Double = 0.0, // This is the TOTAL order price
     val createdAt: Timestamp = Timestamp.now(),
+    val cancelledObservedAt: Timestamp? = null,
     val items: List<OrderItemDetail> = emptyList() // This list is FILTERED
 )

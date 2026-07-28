@@ -15,24 +15,31 @@ import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.google.firebase.firestore.DocumentChange
 import com.google.firebase.firestore.ListenerRegistration
+import com.google.firebase.firestore.Query
 import com.google.firebase.firestore.ktx.firestore
 import com.google.firebase.ktx.Firebase
 import com.yumzy.restaurant.MainActivity
 import com.yumzy.restaurant.OrderAlarmActivity
 import com.yumzy.restaurant.R
+import com.yumzy.restaurant.utils.OrderAlertTracker
 
 class OrderMonitorService : Service() {
 
     private var firestoreListener: ListenerRegistration? = null
     private val CHANNEL_ID_FOREGROUND = "yumzy_restaurant_service"
     private val CHANNEL_ID_ALERTS = "yumzy_restaurant_alerts"
+    private val CHANNEL_ID_CANCEL_ALERTS = "yumzy_restaurant_cancel_alerts"
     private val NOTIFICATION_ID_SERVICE = 1
     private val PREFS_NAME = "YumzyPartnerPrefs"
+
+    // All order statuses this service needs to watch for this partner.
+    private val WATCHED_STATUSES = listOf("Pending", "Accepted", "Preparing", "On the way", "Cancelled")
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannels()
         startForeground(NOTIFICATION_ID_SERVICE, createForegroundNotification())
+        OrderAlertTracker.purgeExpiredCancelMeta(this)
         startFirestoreListener()
     }
 
@@ -46,10 +53,17 @@ class OrderMonitorService : Service() {
             return
         }
 
+        val partnerName = restaurantName.trim()
         val db = Firebase.firestore
 
+        // FIX: added orderBy + limit. Firestore doesn't guarantee document order without an
+        // orderBy clause, and the previous unbounded query could theoretically miss/starve
+        // out recent documents as the collection grows. Ordering by createdAt + a sane limit
+        // keeps this bounded to the most recent, relevant orders.
         firestoreListener = db.collection("orders")
-            .whereIn("orderStatus", listOf("Pending", "Accepted", "Preparing", "On the way"))
+            .whereIn("orderStatus", WATCHED_STATUSES)
+            .orderBy("createdAt", Query.Direction.DESCENDING)
+            .limit(100)
             .addSnapshotListener { snapshots, e ->
                 if (e != null) {
                     Log.e("OrderService", "Listen failed.", e)
@@ -58,26 +72,69 @@ class OrderMonitorService : Service() {
 
                 if (snapshots != null) {
                     for (dc in snapshots.documentChanges) {
-                        if (dc.type == DocumentChange.Type.ADDED) {
-                            val allItems = dc.document.get("items") as? List<Map<String, Any>> ?: emptyList()
+                        val allItems = dc.document.get("items") as? List<Map<String, Any>> ?: emptyList()
 
-                            val hasRestaurantItems = allItems.any { itemMap ->
-                                val itemMiniResName = itemMap["miniResName"] as? String ?: ""
-                                itemMiniResName.trim().equals(restaurantName.trim(), ignoreCase = true)
+                        val partnerItems = allItems.filter { itemMap ->
+                            val itemMiniResName = (itemMap["miniResName"] as? String)?.trim() ?: ""
+                            itemMiniResName.equals(partnerName, ignoreCase = true)
+                        }
+
+                        if (partnerItems.isEmpty()) continue
+
+                        val orderId = dc.document.id
+                        val customerName = dc.document.getString("userName") ?: "Customer"
+                        val orderStatus = dc.document.getString("orderStatus") ?: "New"
+                        val userSubLocation = dc.document.getString("userSubLocation") ?: ""
+                        val userPhone = dc.document.getString("userPhone") ?: ""
+                        val itemCount = partnerItems.sumOf { (it["quantity"] as? Number)?.toInt() ?: 0 }
+                        val itemNames = partnerItems.joinToString(", ") { item ->
+                            val qty = (item["quantity"] as? Number)?.toInt() ?: 0
+                            val name = item["itemName"] as? String ?: "Unknown"
+                            "${qty}x $name"
+                        }
+
+                        if (orderStatus == "Cancelled") {
+                            // FIX: dedup so the same order never re-triggers the alarm, and so
+                            // the alarm actually fires once (previously "Cancelled" wasn't
+                            // watched by this service at all, so restaurants never got any
+                            // alert when a customer cancelled).
+                            if (OrderAlertTracker.hasAlertedCancelledOrder(this, orderId)) continue
+
+                            val hadProgress = partnerItems.any { item ->
+                                val partnerStatus = item["partnerStatus"] as? String
+                                partnerStatus == "Accepted" || partnerStatus == "Ready"
                             }
+                            OrderAlertTracker.recordCancelMeta(this, orderId, hadProgress)
+                            OrderAlertTracker.markCancelledOrderAlerted(this, orderId)
 
-                            if (hasRestaurantItems) {
-                                val orderId = dc.document.id
-                                val customerName = dc.document.getString("userName") ?: "Customer"
-                                val orderStatus = dc.document.getString("orderStatus") ?: "New"
+                            triggerAlarmAndNotification(
+                                type = "cancel",
+                                orderId = orderId,
+                                customerName = customerName,
+                                orderStatus = orderStatus,
+                                itemCount = itemCount,
+                                itemNames = itemNames,
+                                userSubLocation = userSubLocation,
+                                userPhone = userPhone
+                            )
+                        } else if (dc.type == DocumentChange.Type.ADDED) {
+                            // FIX: Firestore replays the *entire initial snapshot* as ADDED
+                            // events. Without this dedup check, every service restart used to
+                            // re-alarm for every currently active order at once, flooding the
+                            // partner with alarms and effectively burying the next real one.
+                            if (OrderAlertTracker.hasAlertedNewOrder(this, orderId)) continue
+                            OrderAlertTracker.markNewOrderAlerted(this, orderId)
 
-                                val itemCount = allItems.count { itemMap ->
-                                    val itemMiniResName = itemMap["miniResName"] as? String ?: ""
-                                    itemMiniResName.trim().equals(restaurantName.trim(), ignoreCase = true)
-                                }
-
-                                triggerAlarmAndNotification(orderId, customerName, orderStatus, itemCount)
-                            }
+                            triggerAlarmAndNotification(
+                                type = "new",
+                                orderId = orderId,
+                                customerName = customerName,
+                                orderStatus = orderStatus,
+                                itemCount = itemCount,
+                                itemNames = itemNames,
+                                userSubLocation = userSubLocation,
+                                userPhone = userPhone
+                            )
                         }
                     }
                 }
@@ -85,18 +142,29 @@ class OrderMonitorService : Service() {
     }
 
     private fun triggerAlarmAndNotification(
+        type: String, // "new" or "cancel"
         orderId: String,
         customerName: String,
         orderStatus: String,
-        itemCount: Int
+        itemCount: Int,
+        itemNames: String,
+        userSubLocation: String,
+        userPhone: String
     ) {
+        val isCancel = type == "cancel"
+        val channelId = if (isCancel) CHANNEL_ID_CANCEL_ALERTS else CHANNEL_ID_ALERTS
+
         // Launch full-screen alarm activity
         val alarmIntent = Intent(this, OrderAlarmActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra("TYPE", type)
             putExtra("ORDER_ID", orderId)
             putExtra("CUSTOMER_NAME", customerName)
             putExtra("ORDER_STATUS", orderStatus)
             putExtra("ITEM_COUNT", itemCount)
+            putExtra("ITEM_NAMES", itemNames)
+            putExtra("USER_SUB_LOCATION", userSubLocation)
+            putExtra("USER_PHONE", userPhone)
         }
 
         val fullScreenPendingIntent = PendingIntent.getActivity(
@@ -114,14 +182,23 @@ class OrderMonitorService : Service() {
 
         val soundUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
 
-        val notification = NotificationCompat.Builder(this, CHANNEL_ID_ALERTS)
+        val title = if (isCancel) "Order Cancelled!" else "New Order Received!"
+        val shortText = if (isCancel) {
+            "$itemCount item(s) from $customerName was cancelled"
+        } else {
+            "$itemCount item(s) from $customerName - Status: $orderStatus"
+        }
+        val bigText = if (isCancel) {
+            "Order #${orderId.take(6)}\n$itemNames\nCancelled by $customerName"
+        } else {
+            "Order #${orderId.take(6)}\n$itemCount item(s) from $customerName\nStatus: $orderStatus"
+        }
+
+        val notification = NotificationCompat.Builder(this, channelId)
             .setSmallIcon(R.mipmap.ic_launcher_round)
-            .setContentTitle("New Order Received!")
-            .setContentText("$itemCount item(s) from $customerName - Status: $orderStatus")
-            .setStyle(
-                NotificationCompat.BigTextStyle()
-                    .bigText("Order #${orderId.take(6)}\n$itemCount item(s) from $customerName\nStatus: $orderStatus")
-            )
+            .setContentTitle(title)
+            .setContentText(shortText)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(bigText))
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setCategory(NotificationCompat.CATEGORY_ALARM)
             .setSound(soundUri)
@@ -164,14 +241,14 @@ class OrderMonitorService : Service() {
             }
             manager.createNotificationChannel(serviceChannel)
 
-            // Loud Channel for New Orders with HIGH importance
-            val soundUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
-                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
-
             val audioAttributes = AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_ALARM)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
                 .build()
+
+            // Loud Channel for New Orders with HIGH importance
+            val newOrderSoundUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
 
             val alertChannel = NotificationChannel(
                 CHANNEL_ID_ALERTS,
@@ -180,9 +257,22 @@ class OrderMonitorService : Service() {
             ).apply {
                 description = "Notifications for new incoming orders"
                 enableVibration(true)
-                setSound(soundUri, audioAttributes)
+                setSound(newOrderSoundUri, audioAttributes)
             }
             manager.createNotificationChannel(alertChannel)
+
+            // Loud channel dedicated to cancellations, so partners can tell them apart in
+            // system settings if they ever want to customize either independently.
+            val cancelChannel = NotificationChannel(
+                CHANNEL_ID_CANCEL_ALERTS,
+                "Cancelled Order Alerts",
+                NotificationManager.IMPORTANCE_HIGH
+            ).apply {
+                description = "Notifications for orders cancelled by customers"
+                enableVibration(true)
+                setSound(newOrderSoundUri, audioAttributes)
+            }
+            manager.createNotificationChannel(cancelChannel)
         }
     }
 

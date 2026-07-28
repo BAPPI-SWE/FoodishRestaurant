@@ -31,10 +31,13 @@ fun DeliveryHistoryScreen(
 ) {
     var completedOrders by remember { mutableStateOf<List<PartnerOrder>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
+    var loadError by remember { mutableStateOf<String?>(null) }
     var searchText by remember { mutableStateOf("") }
     var startDate by remember { mutableStateOf<Long?>(null) }
     var endDate by remember { mutableStateOf<Long?>(null) }
+    var selectedTab by remember { mutableIntStateOf(0) }
     val context = LocalContext.current
+    val tabs = listOf("Orders", "Item Summary")
 
     fun showDatePicker(onDateSelected: (Long) -> Unit) {
         val calendar = Calendar.getInstance()
@@ -52,17 +55,24 @@ fun DeliveryHistoryScreen(
 
     LaunchedEffect(restaurantName) {
         if (restaurantName.isBlank()) {
+            loadError = "Restaurant name is missing. Please re-login."
             isLoading = false
             return@LaunchedEffect
         }
 
+        val partnerName = restaurantName.trim().replace(Regex("\\s+"), " ")
         val db = Firebase.firestore
         db.collection("orders")
             .whereEqualTo("orderStatus", "Delivered")
             .orderBy("createdAt", Query.Direction.DESCENDING)
-            .limit(100)
+            // FIX: raised from 100 -> 500. A busy store can easily rack up more than 100
+            // delivered orders, and once it does, older ones would silently vanish from
+            // history/search/totals with no indication why. 500 gives a much more realistic
+            // window while still keeping the listener bounded.
+            .limit(500)
             .addSnapshotListener { snapshot, error ->
                 if (error != null) {
+                    loadError = "Error loading history: ${error.message}"
                     isLoading = false
                     return@addSnapshotListener
                 }
@@ -71,36 +81,44 @@ fun DeliveryHistoryScreen(
                     val partnerOrders = mutableListOf<PartnerOrder>()
 
                     for (doc in snapshot.documents) {
-                        val allItems = doc.get("items") as? List<Map<String, Any>> ?: emptyList()
+                        try {
+                            val allItems = doc.get("items") as? List<Map<String, Any>> ?: emptyList()
 
-                        val partnerItems = allItems.mapNotNull { itemMap ->
-                            val itemMiniResName = itemMap["miniResName"] as? String ?: ""
-                            val cleanPartnerName = restaurantName.trim()
-                            val cleanItemResName = itemMiniResName.trim()
+                            val partnerItems = allItems.mapNotNull { itemMap ->
+                                val rawName = itemMap["miniResName"] as? String ?: ""
+                                // FIX: normalize whitespace (not just trim) so a stray double
+                                // space or odd whitespace character in the stored item name
+                                // doesn't silently drop it from this restaurant's totals - the
+                                // same class of bug that was hiding items in Live Orders too.
+                                val normalizedItemRes = rawName.trim().replace(Regex("\\s+"), " ")
 
-                            if (cleanItemResName.isNotEmpty() && cleanItemResName.equals(cleanPartnerName, ignoreCase = true)) {
-                                OrderItemDetail(
-                                    name = itemMap["itemName"] as? String ?: "Unknown",
-                                    quantity = (itemMap["quantity"] as? Number)?.toInt() ?: 0,
-                                    price = (itemMap["price"] as? Number)?.toDouble() ?: 0.0,
-                                    miniResName = itemMiniResName
+                                if (normalizedItemRes.isNotEmpty() && normalizedItemRes.equals(partnerName, ignoreCase = true)) {
+                                    OrderItemDetail(
+                                        name = itemMap["itemName"] as? String ?: "Unknown",
+                                        quantity = (itemMap["quantity"] as? Number)?.toInt() ?: 0,
+                                        price = (itemMap["price"] as? Number)?.toDouble() ?: 0.0,
+                                        miniResName = rawName
+                                    )
+                                } else {
+                                    null
+                                }
+                            }
+
+                            if (partnerItems.isNotEmpty()) {
+                                val order = doc.toObject(PartnerOrder::class.java)?.copy(
+                                    id = doc.id,
+                                    items = partnerItems
                                 )
-                            } else {
-                                null
+                                if (order != null) {
+                                    partnerOrders.add(order)
+                                }
                             }
-                        }
-
-                        if (partnerItems.isNotEmpty()) {
-                            val order = doc.toObject(PartnerOrder::class.java)?.copy(
-                                id = doc.id,
-                                items = partnerItems
-                            )
-                            if (order != null) {
-                                partnerOrders.add(order)
-                            }
+                        } catch (e: Exception) {
+                            // Skip malformed documents rather than crashing the whole listener.
                         }
                     }
                     completedOrders = partnerOrders
+                    loadError = null
                 }
                 isLoading = false
             }
@@ -146,6 +164,30 @@ fun DeliveryHistoryScreen(
         }
     }
 
+    // Item-level aggregation, shared by the "Item Summary" tab. This mirrors the kind of
+    // per-item sales rollup the admin app shows, but scoped to this partner's filtered orders.
+    data class ItemSummaryRow(
+        val name: String,
+        val quantity: Int,
+        val revenue: Double
+    )
+
+    val itemSummary by remember(filteredOrders) {
+        derivedStateOf {
+            filteredOrders
+                .flatMap { it.items }
+                .groupBy { it.name }
+                .map { (name, items) ->
+                    ItemSummaryRow(
+                        name = name,
+                        quantity = items.sumOf { it.quantity },
+                        revenue = items.sumOf { it.price * it.quantity }
+                    )
+                }
+                .sortedByDescending { it.revenue }
+        }
+    }
+
     val totalDeliveries = filteredOrders.size
     val totalEarnings = filteredOrders.sumOf { partnerOrder ->
         partnerOrder.items.sumOf { item -> item.price * item.quantity }
@@ -170,67 +212,101 @@ fun DeliveryHistoryScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(paddingValues)
-                .padding(16.dp)
         ) {
-            OutlinedTextField(
-                value = searchText,
-                onValueChange = { searchText = it },
-                modifier = Modifier.fillMaxWidth(),
-                label = { Text("Search History") },
-                placeholder = { Text("Search by customer name or order ID...") },
-                leadingIcon = { Icon(Icons.Default.Search, contentDescription = "Search Icon") }
-            )
+            Column(modifier = Modifier.padding(16.dp)) {
+                OutlinedTextField(
+                    value = searchText,
+                    onValueChange = { searchText = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("Search History") },
+                    placeholder = { Text("Search by customer name or order ID...") },
+                    leadingIcon = { Icon(Icons.Default.Search, contentDescription = "Search Icon") }
+                )
+                Spacer(modifier = Modifier.height(8.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(onClick = { showDatePicker { startDate = it } }, modifier = Modifier.weight(1f)) {
+                        Text(startDate?.let { SimpleDateFormat("dd MMM yy", Locale.getDefault()).format(Date(it)) } ?: "Start Date")
+                    }
+                    Button(onClick = { showDatePicker { endDate = it } }, modifier = Modifier.weight(1f)) {
+                        Text(endDate?.let { SimpleDateFormat("dd MMM yy", Locale.getDefault()).format(Date(it)) } ?: "End Date")
+                    }
+                    TextButton(onClick = {
+                        startDate = null
+                        endDate = null
+                    }) {
+                        Text("Clear")
+                    }
+                }
+            }
+
+            TabRow(selectedTabIndex = selectedTab) {
+                tabs.forEachIndexed { index, title ->
+                    Tab(
+                        selected = selectedTab == index,
+                        onClick = { selectedTab = index },
+                        text = { Text(title) }
+                    )
+                }
+            }
             Spacer(modifier = Modifier.height(8.dp))
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Button(onClick = { showDatePicker { startDate = it } }, modifier = Modifier.weight(1f)) {
-                    Text(startDate?.let { SimpleDateFormat("dd MMM yy", Locale.getDefault()).format(Date(it)) } ?: "Start Date")
-                }
-                Button(onClick = { showDatePicker { endDate = it } }, modifier = Modifier.weight(1f)) {
-                    Text(endDate?.let { SimpleDateFormat("dd MMM yy", Locale.getDefault()).format(Date(it)) } ?: "End Date")
-                }
-                TextButton(onClick = {
-                    startDate = null
-                    endDate = null
-                }) {
-                    Text("Clear")
-                }
-            }
-            Spacer(modifier = Modifier.height(16.dp))
-
-            if (isLoading) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    CircularProgressIndicator()
-                }
-            } else if (completedOrders.isEmpty() && searchText.isBlank()){
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("You have no completed deliveries yet.", color = Color.Gray)
-                }
-            }
-            else {
-                SummaryCard(
-                    totalDeliveries = totalDeliveries,
-                    totalEarnings = totalEarnings,
-                    totalItems = totalItems
-                )
-                Spacer(modifier = Modifier.height(16.dp))
-
-                if (filteredOrders.isEmpty()) {
-                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        val emptyText = when {
-                            searchText.isNotBlank() -> "No deliveries found for \"$searchText\""
-                            else -> "No deliveries found in the selected date range."
+            Box(modifier = Modifier.weight(1f).padding(horizontal = 16.dp)) {
+                when {
+                    isLoading -> {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            CircularProgressIndicator()
                         }
-                        Text(emptyText, color = Color.Gray)
                     }
-                } else {
-                    LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        items(filteredOrders) { order ->
-                            PartnerHistoryOrderCard(order = order)
+                    loadError != null -> {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text(loadError ?: "Unknown error", color = MaterialTheme.colorScheme.error)
+                        }
+                    }
+                    completedOrders.isEmpty() && searchText.isBlank() -> {
+                        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            Text("You have no completed deliveries yet.", color = Color.Gray)
+                        }
+                    }
+                    else -> {
+                        Column(Modifier.fillMaxSize()) {
+                            SummaryCard(
+                                totalDeliveries = totalDeliveries,
+                                totalEarnings = totalEarnings,
+                                totalItems = totalItems
+                            )
+                            Spacer(modifier = Modifier.height(16.dp))
+
+                            if (filteredOrders.isEmpty()) {
+                                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                                    val emptyText = when {
+                                        searchText.isNotBlank() -> "No deliveries found for \"$searchText\""
+                                        else -> "No deliveries found in the selected date range."
+                                    }
+                                    Text(emptyText, color = Color.Gray)
+                                }
+                            } else if (selectedTab == 0) {
+                                LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    items(filteredOrders, key = { it.id }) { order ->
+                                        PartnerHistoryOrderCard(order = order)
+                                    }
+                                }
+                            } else {
+                                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    items(itemSummary, key = { it.name }) { row ->
+                                        ItemSummaryCard(
+                                            name = row.name,
+                                            quantity = row.quantity,
+                                            revenue = row.revenue
+                                        )
+                                    }
+                                    item { Spacer(modifier = Modifier.height(8.dp)) }
+                                }
+                            }
                         }
                     }
                 }
@@ -321,7 +397,7 @@ fun PartnerHistoryOrderCard(order: PartnerOrder) {
                     )
                 }
                 Text(
-                    "Your Cut: ৳$partnerEarnings",
+                    "Your Cut: ৳${"%.2f".format(partnerEarnings)}",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.primary
@@ -359,12 +435,51 @@ fun PartnerHistoryOrderCard(order: PartnerOrder) {
                         modifier = Modifier.weight(1f)
                     )
                     Text(
-                        "৳${item.price * item.quantity}",
+                        "৳${"%.2f".format(item.price * item.quantity)}",
                         style = MaterialTheme.typography.bodyMedium,
                         color = Color.Gray
                     )
                 }
             }
+        }
+    }
+}
+
+/**
+ * One row of the "Item Summary" tab - total quantity sold and total revenue for a single
+ * item name, across every order currently matched by the search/date filters.
+ */
+@Composable
+fun ItemSummaryCard(name: String, quantity: Int, revenue: Double) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        elevation = CardDefaults.cardElevation(1.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 12.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(
+                    name,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    "$quantity sold",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color.Gray
+                )
+            }
+            Text(
+                "৳${"%.2f".format(revenue)}",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = MaterialTheme.colorScheme.primary
+            )
         }
     }
 }

@@ -1,5 +1,6 @@
 package com.yumzy.restaurant.screens.orders
 
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.widget.Toast
@@ -10,6 +11,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Call
+import androidx.compose.material.icons.filled.Cancel
 import androidx.compose.material.icons.filled.Chat
 import androidx.compose.material.icons.filled.Phone
 import androidx.compose.material.icons.filled.Storefront
@@ -17,93 +19,181 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.google.firebase.firestore.DocumentChange
+import com.google.firebase.firestore.DocumentSnapshot
+import com.google.firebase.firestore.ListenerRegistration
+import com.google.firebase.firestore.Query
 import com.google.firebase.firestore.ktx.firestore
 import com.google.firebase.ktx.Firebase
+import com.yumzy.restaurant.OrderAlarmActivity
 import com.yumzy.restaurant.data.MiniRestaurant
 import com.yumzy.restaurant.data.OrderItemDetail
 import com.yumzy.restaurant.data.PartnerOrder
+import com.yumzy.restaurant.utils.OrderAlertTracker
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.tasks.await
 import java.text.SimpleDateFormat
 import java.util.*
 
+private val ACTIVE_STATUSES = listOf("Pending", "Accepted", "Preparing", "On the way")
+private val WATCHED_STATUSES = ACTIVE_STATUSES + "Cancelled"
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LiveOrdersScreen(loggedInRestaurant: MiniRestaurant) {
-    var partnerOrders by remember { mutableStateOf<List<PartnerOrder>>(emptyList()) }
+    var activeOrders by remember { mutableStateOf<List<PartnerOrder>>(emptyList()) }
+    var cancelledOrders by remember { mutableStateOf<List<PartnerOrder>>(emptyList()) }
     var isLoading by remember { mutableStateOf(true) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
+    val context = LocalContext.current
 
-    LaunchedEffect(loggedInRestaurant.name) {
+    // Re-evaluated periodically so a cancelled order silently drops off the list once its
+    // 10-minute grace period elapses, even if no new Firestore snapshot arrives in the meantime.
+    var nowTick by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            delay(15_000)
+            nowTick = System.currentTimeMillis()
+        }
+    }
+
+    // FIX: previous version never removed its snapshot listener, so navigating away and back
+    // (or restaurant name changing) piled up duplicate listeners. DisposableEffect + explicit
+    // remove() fixes that leak.
+    DisposableEffect(loggedInRestaurant.name) {
         val db = Firebase.firestore
-        // FIX 1: Trim the partner name once here to avoid repeated trimming
         val partnerName = loggedInRestaurant.name?.trim() ?: ""
+        var registration: ListenerRegistration? = null
 
         if (partnerName.isEmpty()) {
             errorMessage = "Restaurant name is missing. Please re-login."
             isLoading = false
-            return@LaunchedEffect
-        }
+        } else {
+            fun extractPartnerOrder(doc: DocumentSnapshot): PartnerOrder? {
+                return try {
+                    val allItems = doc.get("items") as? List<Map<String, Any>> ?: emptyList()
 
-        db.collection("orders")
-            .whereIn("orderStatus", listOf("Pending", "Accepted", "Preparing", "On the way"))
-            .limit(50)
-            .addSnapshotListener { snapshot, error ->
-                if (error != null) {
-                    errorMessage = "Error loading orders: ${error.message}"
-                    isLoading = false
-                    return@addSnapshotListener
-                }
+                    // FIX: normalize whitespace (not just trim) before comparing names, so a
+                    // stray double-space or non-breaking space in either the order item or the
+                    // restaurant's saved name doesn't silently hide an order from the partner.
+                    val normalizedPartner = partnerName.replace(Regex("\\s+"), " ")
 
-                if (snapshot != null) {
-                    val newPartnerOrders = mutableListOf<PartnerOrder>()
+                    val partnerItems = allItems.mapNotNull { itemMap ->
+                        val rawName = (itemMap["miniResName"] as? String) ?: ""
+                        val normalizedItem = rawName.trim().replace(Regex("\\s+"), " ")
 
-                    for (doc in snapshot.documents) {
-                        try {
-                            val allItems = doc.get("items") as? List<Map<String, Any>> ?: emptyList()
-
-                            // FIX 2: Carry partnerStatus from Firestore into OrderItemDetail
-                            val partnerItems = allItems.mapNotNull { itemMap ->
-                                val itemMiniResName = (itemMap["miniResName"] as? String)?.trim() ?: ""
-
-                                if (itemMiniResName.equals(partnerName, ignoreCase = true)) {
-                                    OrderItemDetail(
-                                        name = itemMap["itemName"] as? String ?: "Unknown",
-                                        quantity = (itemMap["quantity"] as? Number)?.toInt() ?: 0,
-                                        price = (itemMap["price"] as? Number)?.toDouble() ?: 0.0,
-                                        miniResName = itemMiniResName,
-                                        // FIX 3: Read partnerStatus from Firestore so button state persists
-                                        partnerStatus = itemMap["partnerStatus"] as? String
-                                    )
-                                } else {
-                                    null
-                                }
-                            }
-
-                            if (partnerItems.isNotEmpty()) {
-                                val order = doc.toObject(PartnerOrder::class.java)?.copy(
-                                    id = doc.id,
-                                    items = partnerItems
-                                )
-                                if (order != null) {
-                                    newPartnerOrders.add(order)
-                                }
-                            }
-                        } catch (e: Exception) {
-                            // Skip malformed documents silently
+                        if (normalizedItem.isNotEmpty() && normalizedItem.equals(normalizedPartner, ignoreCase = true)) {
+                            OrderItemDetail(
+                                name = itemMap["itemName"] as? String ?: "Unknown",
+                                quantity = (itemMap["quantity"] as? Number)?.toInt() ?: 0,
+                                price = (itemMap["price"] as? Number)?.toDouble() ?: 0.0,
+                                miniResName = rawName,
+                                partnerStatus = itemMap["partnerStatus"] as? String
+                            )
+                        } else {
+                            null
                         }
                     }
 
-                    partnerOrders = newPartnerOrders.sortedByDescending { it.createdAt }
-                    errorMessage = null
+                    if (partnerItems.isEmpty()) return null
+
+                    doc.toObject(PartnerOrder::class.java)?.copy(
+                        id = doc.id,
+                        items = partnerItems
+                    )
+                } catch (e: Exception) {
+                    null
                 }
-                isLoading = false
             }
+
+            registration = db.collection("orders")
+                .whereIn("orderStatus", WATCHED_STATUSES)
+                // FIX: orderBy + limit added. Without an orderBy, Firestore doesn't guarantee
+                // which documents a limit() keeps as the collection grows, which could quietly
+                // exclude a brand-new order from the results entirely.
+                .orderBy("createdAt", Query.Direction.DESCENDING)
+                .limit(100)
+                .addSnapshotListener { snapshot, error ->
+                    if (error != null) {
+                        errorMessage = "Error loading orders: ${error.message}"
+                        isLoading = false
+                        return@addSnapshotListener
+                    }
+                    if (snapshot == null) {
+                        isLoading = false
+                        return@addSnapshotListener
+                    }
+
+                    // Fire alarms for anything genuinely new (deduped by OrderAlertTracker so
+                    // this never re-fires just because the listener restarted).
+                    for (dc in snapshot.documentChanges) {
+                        val order = extractPartnerOrder(dc.document) ?: continue
+                        val status = dc.document.getString("orderStatus") ?: continue
+
+                        if (status == "Cancelled") {
+                            if (!OrderAlertTracker.hasAlertedCancelledOrder(context, order.id)) {
+                                val hadProgress = order.items.any {
+                                    it.partnerStatus == "Accepted" || it.partnerStatus == "Ready"
+                                }
+                                OrderAlertTracker.recordCancelMeta(context, order.id, hadProgress)
+                                OrderAlertTracker.markCancelledOrderAlerted(context, order.id)
+                                launchOrderAlarm(context, order, type = "cancel")
+                            }
+                        } else if (dc.type == DocumentChange.Type.ADDED) {
+                            if (!OrderAlertTracker.hasAlertedNewOrder(context, order.id)) {
+                                OrderAlertTracker.markNewOrderAlerted(context, order.id)
+                                launchOrderAlarm(context, order, type = "new")
+                            }
+                        }
+                    }
+
+                    // Build the full display lists from the whole snapshot (not just the diff).
+                    val allOrders = snapshot.documents.mapNotNull { extractPartnerOrder(it) }
+
+                    activeOrders = allOrders
+                        .filter { it.orderStatus != "Cancelled" }
+                        .sortedByDescending { it.createdAt.toDate().time }
+
+                    cancelledOrders = allOrders
+                        .filter { it.orderStatus == "Cancelled" }
+                        .mapNotNull { order ->
+                            val meta = OrderAlertTracker.getCancelMeta(context, order.id)
+                                ?: OrderAlertTracker.recordCancelMeta(
+                                    context,
+                                    order.id,
+                                    order.items.any { i -> i.partnerStatus == "Accepted" || i.partnerStatus == "Ready" }
+                                )
+                            // "Undo" rule: if the order was cancelled before the partner ever
+                            // accepted/marked it ready, there's nothing to keep - don't show it.
+                            if (!meta.hadProgress) return@mapNotNull null
+                            order
+                        }
+                        .sortedByDescending { it.createdAt.toDate().time }
+
+                    errorMessage = null
+                    isLoading = false
+                }
+        }
+
+        onDispose {
+            registration?.remove()
+        }
+    }
+
+    // Drop cancelled orders whose 10-minute grace period has expired, independent of whether
+    // a new snapshot has arrived.
+    val visibleCancelledOrders by remember(cancelledOrders, nowTick) {
+        derivedStateOf {
+            cancelledOrders.filter { order ->
+                val meta = OrderAlertTracker.getCancelMeta(context, order.id)
+                meta != null && (nowTick - meta.firstSeenAt) <= OrderAlertTracker.CANCEL_GRACE_PERIOD_MS
+            }
+        }
     }
 
     Scaffold(
@@ -133,7 +223,7 @@ fun LiveOrdersScreen(loggedInRestaurant: MiniRestaurant) {
                         )
                     }
                 }
-                partnerOrders.isEmpty() -> {
+                activeOrders.isEmpty() && visibleCancelledOrders.isEmpty() -> {
                     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                         Column(horizontalAlignment = Alignment.CenterHorizontally) {
                             Icon(Icons.Default.Storefront, "No orders", Modifier.size(64.dp), tint = Color.Gray)
@@ -147,10 +237,36 @@ fun LiveOrdersScreen(loggedInRestaurant: MiniRestaurant) {
                         contentPadding = PaddingValues(16.dp),
                         verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        items(partnerOrders, key = { it.id }) { order ->
+                        items(activeOrders, key = { it.id }) { order ->
                             PartnerOrderCard(
                                 order = order,
-                                partnerName = loggedInRestaurant.name ?: ""
+                                partnerName = loggedInRestaurant.name ?: "",
+                                isCancelled = false
+                            )
+                        }
+
+                        if (visibleCancelledOrders.isNotEmpty()) {
+                            item(key = "cancelled_header") {
+                                Text(
+                                    "Recently Cancelled",
+                                    style = MaterialTheme.typography.titleMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color(0xFFB71C1C),
+                                    modifier = Modifier.padding(top = 8.dp)
+                                )
+                            }
+                        }
+
+                        items(visibleCancelledOrders, key = { "cancelled_${it.id}" }) { order ->
+                            val meta = OrderAlertTracker.getCancelMeta(context, order.id)
+                            val remainingMs = meta?.let {
+                                (OrderAlertTracker.CANCEL_GRACE_PERIOD_MS - (nowTick - it.firstSeenAt)).coerceAtLeast(0)
+                            } ?: 0
+                            PartnerOrderCard(
+                                order = order,
+                                partnerName = loggedInRestaurant.name ?: "",
+                                isCancelled = true,
+                                autoHideInMillis = remainingMs
                             )
                         }
                     }
@@ -160,23 +276,46 @@ fun LiveOrdersScreen(loggedInRestaurant: MiniRestaurant) {
     }
 }
 
+private fun launchOrderAlarm(context: Context, order: PartnerOrder, type: String) {
+    val itemNames = order.items.joinToString(", ") { "${it.quantity}x ${it.name}" }
+    val intent = Intent(context, OrderAlarmActivity::class.java).apply {
+        flags = Intent.FLAG_ACTIVITY_NEW_TASK
+        putExtra("TYPE", type)
+        putExtra("ORDER_ID", order.id)
+        putExtra("CUSTOMER_NAME", order.userName)
+        putExtra("ORDER_STATUS", order.orderStatus)
+        putExtra("ITEM_COUNT", order.items.sumOf { it.quantity })
+        putExtra("ITEM_NAMES", itemNames)
+        putExtra("USER_SUB_LOCATION", order.userSubLocation)
+        putExtra("USER_PHONE", order.userPhone)
+    }
+    context.startActivity(intent)
+}
+
 @Composable
-fun PartnerOrderCard(order: PartnerOrder, partnerName: String) {
+fun PartnerOrderCard(
+    order: PartnerOrder,
+    partnerName: String,
+    isCancelled: Boolean = false,
+    autoHideInMillis: Long = 0
+) {
     val sdf = remember { SimpleDateFormat("dd MMM, hh:mm a", Locale.getDefault()) }
     val context = LocalContext.current
     var isUpdating by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
-    // FIX 4: Initialize button state from Firestore data (partnerStatus on the item),
-    // not from local remember that resets to null on every recomposition/navigation.
+    // Initialize button state from Firestore data (partnerStatus on the item), not from local
+    // remember that resets to null on every recomposition/navigation.
     var currentPartnerStatus by remember(order.id) {
         mutableStateOf(order.items.firstOrNull()?.partnerStatus)
     }
 
-    val statusColor = when (order.orderStatus) {
-        "Pending" -> Color(0xFF757575)
-        "Accepted", "Preparing" -> Color(0xFF0D47A1)
-        "On the way" -> Color(0xFFE65100)
-        "Delivered" -> Color(0xFF1B5E20)
+    val statusColor = when {
+        isCancelled -> Color(0xFFB71C1C)
+        order.orderStatus == "Pending" -> Color(0xFF757575)
+        order.orderStatus == "Accepted" || order.orderStatus == "Preparing" -> Color(0xFF0D47A1)
+        order.orderStatus == "On the way" -> Color(0xFFE65100)
+        order.orderStatus == "Delivered" -> Color(0xFF1B5E20)
         else -> Color.Black
     }
 
@@ -207,12 +346,13 @@ fun PartnerOrderCard(order: PartnerOrder, partnerName: String) {
         }
     }
 
-    val scope = rememberCoroutineScope()
-
     Card(
         modifier = Modifier.fillMaxWidth(),
         elevation = CardDefaults.cardElevation(3.dp),
-        shape = RoundedCornerShape(12.dp)
+        shape = RoundedCornerShape(12.dp),
+        colors = if (isCancelled) CardDefaults.cardColors(
+            containerColor = Color(0xFFB71C1C).copy(alpha = 0.06f)
+        ) else CardDefaults.cardColors()
     ) {
         Column(Modifier.padding(16.dp)) {
 
@@ -229,7 +369,7 @@ fun PartnerOrderCard(order: PartnerOrder, partnerName: String) {
                     )
                     Spacer(Modifier.height(4.dp))
                     Text(
-                        sdf.format(order.createdAt?.toDate() ?: Date()),
+                        sdf.format(order.createdAt.toDate()),
                         style = MaterialTheme.typography.bodySmall,
                         color = Color.Gray
                     )
@@ -340,54 +480,83 @@ fun PartnerOrderCard(order: PartnerOrder, partnerName: String) {
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.Center
                 ) {
-                    Box(modifier = Modifier.size(10.dp).background(statusColor, RoundedCornerShape(50)))
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        text = order.orderStatus,
-                        color = statusColor,
-                        fontWeight = FontWeight.Bold,
-                        style = MaterialTheme.typography.titleMedium
-                    )
+                    if (isCancelled) {
+                        Icon(
+                            Icons.Default.Cancel,
+                            contentDescription = "Cancelled",
+                            tint = statusColor,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            text = "Cancelled by customer",
+                            color = statusColor,
+                            fontWeight = FontWeight.Bold,
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                    } else {
+                        Box(modifier = Modifier.size(10.dp).background(statusColor, RoundedCornerShape(50)))
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            text = order.orderStatus,
+                            color = statusColor,
+                            fontWeight = FontWeight.Bold,
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                    }
                 }
             }
 
-            Spacer(Modifier.height(12.dp))
+            if (isCancelled) {
+                Spacer(Modifier.height(6.dp))
+                val remainingMin = (autoHideInMillis / 1000 / 60)
+                val remainingSec = (autoHideInMillis / 1000 % 60)
+                Text(
+                    text = "Auto-hides in ${remainingMin}m ${remainingSec}s",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color.Gray
+                )
+            }
 
-            // FIX 5: Partner Status Action Buttons — visually reflect current state clearly
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-                val acceptDone = currentPartnerStatus == "Accepted" || currentPartnerStatus == "Ready"
-                val readyDone = currentPartnerStatus == "Ready"
+            // Action buttons are only relevant for orders that are still live.
+            if (!isCancelled) {
+                Spacer(Modifier.height(12.dp))
 
-                OutlinedButton(
-                    onClick = { scope.launch { updatePartnerStatus(order.id, "Accepted") } },
-                    modifier = Modifier.weight(1f),
-                    enabled = !isUpdating && !acceptDone,
-                    colors = if (acceptDone) ButtonDefaults.outlinedButtonColors(
-                        containerColor = Color(0xFF0D47A1).copy(alpha = 0.1f)
-                    ) else ButtonDefaults.outlinedButtonColors()
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    if (isUpdating && currentPartnerStatus == null) {
-                        CircularProgressIndicator(modifier = Modifier.size(16.dp))
-                    } else {
-                        Text(if (acceptDone) "✓ Accepted" else "Accept")
+                    val acceptDone = currentPartnerStatus == "Accepted" || currentPartnerStatus == "Ready"
+                    val readyDone = currentPartnerStatus == "Ready"
+
+                    OutlinedButton(
+                        onClick = { scope.launch { updatePartnerStatus(order.id, "Accepted") } },
+                        modifier = Modifier.weight(1f),
+                        enabled = !isUpdating && !acceptDone,
+                        colors = if (acceptDone) ButtonDefaults.outlinedButtonColors(
+                            containerColor = Color(0xFF0D47A1).copy(alpha = 0.1f)
+                        ) else ButtonDefaults.outlinedButtonColors()
+                    ) {
+                        if (isUpdating && currentPartnerStatus == null) {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp))
+                        } else {
+                            Text(if (acceptDone) "✓ Accepted" else "Accept")
+                        }
                     }
-                }
 
-                Button(
-                    onClick = { scope.launch { updatePartnerStatus(order.id, "Ready") } },
-                    modifier = Modifier.weight(1f),
-                    enabled = !isUpdating && !readyDone,
-                    colors = if (readyDone) ButtonDefaults.buttonColors(
-                        containerColor = Color(0xFF2E7D32)
-                    ) else ButtonDefaults.buttonColors()
-                ) {
-                    if (isUpdating && currentPartnerStatus == "Accepted") {
-                        CircularProgressIndicator(modifier = Modifier.size(16.dp), color = MaterialTheme.colorScheme.onPrimary)
-                    } else {
-                        Text(if (readyDone) "✓ Ready" else "Ready")
+                    Button(
+                        onClick = { scope.launch { updatePartnerStatus(order.id, "Ready") } },
+                        modifier = Modifier.weight(1f),
+                        enabled = !isUpdating && !readyDone,
+                        colors = if (readyDone) ButtonDefaults.buttonColors(
+                            containerColor = Color(0xFF2E7D32)
+                        ) else ButtonDefaults.buttonColors()
+                    ) {
+                        if (isUpdating && currentPartnerStatus == "Accepted") {
+                            CircularProgressIndicator(modifier = Modifier.size(16.dp), color = MaterialTheme.colorScheme.onPrimary)
+                        } else {
+                            Text(if (readyDone) "✓ Ready" else "Ready")
+                        }
                     }
                 }
             }

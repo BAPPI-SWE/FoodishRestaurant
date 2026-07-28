@@ -65,11 +65,11 @@ fun DeliveryHistoryScreen(
         db.collection("orders")
             .whereEqualTo("orderStatus", "Delivered")
             .orderBy("createdAt", Query.Direction.DESCENDING)
-            // FIX: raised from 100 -> 500. A busy store can easily rack up more than 100
-            // delivered orders, and once it does, older ones would silently vanish from
-            // history/search/totals with no indication why. 500 gives a much more realistic
-            // window while still keeping the listener bounded.
-            .limit(500)
+            // FIX: removed the limit() entirely. The admin app's revenue query has no cap at
+            // all (a plain .get() over every Delivered order), so any limit here - even a
+            // generous one - will make a long-running store's totals silently fall short of
+            // admin's the moment it passes that cap. Matching admin exactly means fetching
+            // every Delivered order, same as admin does.
             .addSnapshotListener { snapshot, error ->
                 if (error != null) {
                     loadError = "Error loading history: ${error.message}"

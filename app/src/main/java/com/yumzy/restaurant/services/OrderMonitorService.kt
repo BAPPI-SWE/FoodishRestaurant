@@ -7,12 +7,13 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.media.AudioAttributes
+import android.media.RingtoneManager
 import android.os.Build
 import android.os.IBinder
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.google.firebase.firestore.DocumentChange
-import com.google.firebase.firestore.FieldValue
 import com.google.firebase.firestore.ListenerRegistration
 import com.google.firebase.firestore.Query
 import com.google.firebase.firestore.ktx.firestore
@@ -22,14 +23,6 @@ import com.yumzy.restaurant.OrderAlarmActivity
 import com.yumzy.restaurant.R
 import com.yumzy.restaurant.utils.OrderAlertTracker
 
-/**
- * IMPORTANT: This service is the ONLY place in the app that triggers order alarms (sound +
- * full-screen activity + notification). LiveOrdersScreen only *displays* data - it must not
- * also alarm. Two independent listeners (screen + service) both trying to alarm off the same
- * Firestore events was the root cause of the "two sounds playing" bug: both would pass the
- * dedup check at almost the same instant before either had written the "already alerted" flag,
- * so both fired. A single dispatcher removes that race entirely.
- */
 class OrderMonitorService : Service() {
 
     private var firestoreListener: ListenerRegistration? = null
@@ -39,13 +32,22 @@ class OrderMonitorService : Service() {
     private val NOTIFICATION_ID_SERVICE = 1
     private val PREFS_NAME = "YumzyPartnerPrefs"
 
+    // All order statuses this service needs to watch for this partner.
     private val WATCHED_STATUSES = listOf("Pending", "Accepted", "Preparing", "On the way", "Cancelled")
+
+    // THIS SERVICE IS THE ONLY PLACE THAT TRIGGERS ALARMS / NOTIFICATIONS.
+    // LiveOrdersScreen used to run its own, separate Firestore listener that *also* fired
+    // alarms. Since the service is always running whenever the partner is logged in (started
+    // in MainActivity, stopped only on sign out), having both listeners race to fire the alarm
+    // for the same order was the root cause of "2 sounds playing" / the alarm not stopping
+    // properly - both listeners could pass the "have I alerted this order yet?" check before
+    // either had a chance to mark it, so both launched their own OrderAlarmActivity + their own
+    // MediaPlayer loop. LiveOrdersScreen now only displays data.
 
     override fun onCreate() {
         super.onCreate()
         createNotificationChannels()
         startForeground(NOTIFICATION_ID_SERVICE, createForegroundNotification())
-        OrderAlertTracker.purgeExpiredFallbackTimestamps(this)
         startFirestoreListener()
     }
 
@@ -59,9 +61,13 @@ class OrderMonitorService : Service() {
             return
         }
 
-        val partnerName = restaurantName.trim().replace(Regex("\\s+"), " ")
+        val partnerName = restaurantName.trim()
         val db = Firebase.firestore
 
+        // orderBy + limit: Firestore doesn't guarantee document order without an orderBy
+        // clause, and an unbounded query could theoretically miss/starve out recent documents
+        // as the collection grows. Ordering by createdAt + a sane limit keeps this bounded to
+        // the most recent, relevant orders.
         firestoreListener = db.collection("orders")
             .whereIn("orderStatus", WATCHED_STATUSES)
             .orderBy("createdAt", Query.Direction.DESCENDING)
@@ -77,8 +83,7 @@ class OrderMonitorService : Service() {
                         val allItems = dc.document.get("items") as? List<Map<String, Any>> ?: emptyList()
 
                         val partnerItems = allItems.filter { itemMap ->
-                            val itemMiniResName = (itemMap["miniResName"] as? String)
-                                ?.trim()?.replace(Regex("\\s+"), " ") ?: ""
+                            val itemMiniResName = (itemMap["miniResName"] as? String)?.trim() ?: ""
                             itemMiniResName.equals(partnerName, ignoreCase = true)
                         }
 
@@ -97,24 +102,14 @@ class OrderMonitorService : Service() {
                         }
 
                         if (orderStatus == "Cancelled") {
-                            // Stamp a real, synced Firestore timestamp the first time ANY device
-                            // observes this cancellation, so the 10-minute "show cancelled order"
-                            // countdown is consistent everywhere instead of relying on local,
-                            // per-device guesses. Safe to call every time - it's a no-op once set.
-                            if (dc.document.get("cancelledObservedAt") == null) {
-                                dc.document.reference.update(
-                                    "cancelledObservedAt", FieldValue.serverTimestamp()
-                                ).addOnFailureListener {
-                                    Log.e("OrderService", "Failed to stamp cancelledObservedAt", it)
-                                }
-                            }
-
+                            // Dedup so the same order never re-triggers the alarm.
                             if (OrderAlertTracker.hasAlertedCancelledOrder(this, orderId)) continue
                             OrderAlertTracker.markCancelledOrderAlerted(this, orderId)
 
                             triggerAlarmAndNotification(
                                 type = "cancel",
                                 orderId = orderId,
+                                partnerName = partnerName,
                                 customerName = customerName,
                                 orderStatus = orderStatus,
                                 itemCount = itemCount,
@@ -123,15 +118,16 @@ class OrderMonitorService : Service() {
                                 userPhone = userPhone
                             )
                         } else if (dc.type == DocumentChange.Type.ADDED) {
-                            // FIX: Firestore replays the entire initial snapshot as ADDED events
-                            // on every listener restart. Without this dedup check, every service
-                            // restart used to re-alarm for every currently active order at once.
+                            // Firestore replays the *entire initial snapshot* as ADDED events.
+                            // Without this dedup check, every service restart would re-alarm
+                            // for every currently active order at once.
                             if (OrderAlertTracker.hasAlertedNewOrder(this, orderId)) continue
                             OrderAlertTracker.markNewOrderAlerted(this, orderId)
 
                             triggerAlarmAndNotification(
                                 type = "new",
                                 orderId = orderId,
+                                partnerName = partnerName,
                                 customerName = customerName,
                                 orderStatus = orderStatus,
                                 itemCount = itemCount,
@@ -148,6 +144,7 @@ class OrderMonitorService : Service() {
     private fun triggerAlarmAndNotification(
         type: String, // "new" or "cancel"
         orderId: String,
+        partnerName: String,
         customerName: String,
         orderStatus: String,
         itemCount: Int,
@@ -158,15 +155,23 @@ class OrderMonitorService : Service() {
         val isCancel = type == "cancel"
         val channelId = if (isCancel) CHANNEL_ID_CANCEL_ALERTS else CHANNEL_ID_ALERTS
 
-        // Stable, deterministic ID (instead of the old System.currentTimeMillis().toInt()) so
-        // the alarm Activity can look this exact notification back up and cancel it once the
-        // partner dismisses the popup - that's what fixes "I have to click the notification too".
-        val notificationId = ("order_$orderId").hashCode()
+        // Stable ID per order+type, instead of System.currentTimeMillis().toInt(). This means a
+        // repeat delivery for the same order replaces the existing notification instead of
+        // stacking a new one on top of it, and it lets OrderAlarmActivity cancel the *exact*
+        // notification that spawned it when the partner dismisses the alarm.
+        val notificationId = (orderId + type).hashCode()
 
         val alarmIntent = Intent(this, OrderAlarmActivity::class.java).apply {
-            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            // FLAG_ACTIVITY_SINGLE_TOP (paired with android:launchMode="singleTask" on
+            // OrderAlarmActivity in the manifest) means if an alarm is already showing, a new
+            // one for a different order reuses that same instance via onNewIntent() instead of
+            // stacking a second Activity + a second MediaPlayer on top of it.
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or
+                    Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                    Intent.FLAG_ACTIVITY_SINGLE_TOP
             putExtra("TYPE", type)
             putExtra("ORDER_ID", orderId)
+            putExtra("PARTNER_NAME", partnerName)
             putExtra("CUSTOMER_NAME", customerName)
             putExtra("ORDER_STATUS", orderStatus)
             putExtra("ITEM_COUNT", itemCount)
@@ -188,6 +193,8 @@ class OrderMonitorService : Service() {
         }
         val pendingIntent = PendingIntent.getActivity(this, 0, mainIntent, PendingIntent.FLAG_IMMUTABLE)
 
+        val soundUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+
         val title = if (isCancel) "Order Cancelled!" else "New Order Received!"
         val shortText = if (isCancel) {
             "$itemCount item(s) from $customerName was cancelled"
@@ -207,19 +214,27 @@ class OrderMonitorService : Service() {
             .setStyle(NotificationCompat.BigTextStyle().bigText(bigText))
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setCategory(NotificationCompat.CATEGORY_ALARM)
-            // FIX: no .setSound() here anymore. The channel itself is silent (see
-            // createNotificationChannels) - the full-screen OrderAlarmActivity's own looping
-            // MediaPlayer is the single audible alarm now, instead of two sounds layering.
+            .setSound(soundUri)
             .setContentIntent(pendingIntent)
+            // setFullScreenIntent covers the locked/screen-off case (Android launches it
+            // automatically then). It does NOT auto-launch while the screen is on and unlocked -
+            // in that case Android only shows this as a heads-up notification, which is why the
+            // popup wasn't appearing while the screen was on. We still keep this for the locked
+            // case, and additionally call startActivity() below for the screen-on case.
             .setFullScreenIntent(fullScreenPendingIntent, true)
-            .setAutoCancel(true)
-            .setOngoing(true) // stays until we explicitly cancel it from the alarm activity
+            .setOngoing(true) // stays until explicitly cancelled from OrderAlarmActivity's dismiss button
             .setVibrate(longArrayOf(0, 500, 200, 500))
             .build()
 
         val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         manager.notify(notificationId, notification)
 
+        // Directly launch the popup so it reliably shows even when the screen is already on and
+        // unlocked (the case setFullScreenIntent doesn't cover on its own). This used to cause a
+        // double-launch alongside the full-screen intent, but OrderAlarmActivity's
+        // singleTask launch mode + FLAG_ACTIVITY_SINGLE_TOP + onNewIntent() handling now make a
+        // second launch reuse the same instance (and safely restart the sound) instead of
+        // stacking a second activity and a second MediaPlayer.
         startActivity(alarmIntent)
     }
 
@@ -239,6 +254,7 @@ class OrderMonitorService : Service() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val manager = getSystemService(NotificationManager::class.java)
 
+            // Silent Channel for Background Service
             val serviceChannel = NotificationChannel(
                 CHANNEL_ID_FOREGROUND,
                 "Yumzy Restaurant Service",
@@ -248,10 +264,14 @@ class OrderMonitorService : Service() {
             }
             manager.createNotificationChannel(serviceChannel)
 
-            // FIX: sound set to null on both alert channels. The full-screen OrderAlarmActivity
-            // plays the actual audible alarm via MediaPlayer; the notification's only jobs now
-            // are the full-screen-intent trigger, the heads-up visual, and vibration. Having the
-            // channel ALSO play a sound was the direct cause of "2 sounds playing at once".
+            val audioAttributes = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ALARM)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                .build()
+
+            val newOrderSoundUri = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+                ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+
             val alertChannel = NotificationChannel(
                 CHANNEL_ID_ALERTS,
                 "New Order Alerts",
@@ -259,7 +279,7 @@ class OrderMonitorService : Service() {
             ).apply {
                 description = "Notifications for new incoming orders"
                 enableVibration(true)
-                setSound(null, null)
+                setSound(newOrderSoundUri, audioAttributes)
             }
             manager.createNotificationChannel(alertChannel)
 
@@ -270,7 +290,7 @@ class OrderMonitorService : Service() {
             ).apply {
                 description = "Notifications for orders cancelled by customers"
                 enableVibration(true)
-                setSound(null, null)
+                setSound(newOrderSoundUri, audioAttributes)
             }
             manager.createNotificationChannel(cancelChannel)
         }

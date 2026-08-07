@@ -18,6 +18,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.AddPhotoAlternate
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Percent
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -50,6 +51,8 @@ fun RestaurantItemListScreen(
     var isLoading by remember { mutableStateOf(true) }
     var showDialog by remember { mutableStateOf(false) }
     var itemToEdit by remember { mutableStateOf<StoreItem?>(null) }
+    var showDiscountDialog by remember { mutableStateOf(false) }
+    var isApplyingDiscount by remember { mutableStateOf(false) }
     val coroutineScope = rememberCoroutineScope()
     val context = LocalContext.current
 
@@ -85,6 +88,36 @@ fun RestaurantItemListScreen(
         }
     }
 
+    fun applyDiscountToAllItems(percent: Double) {
+        isApplyingDiscount = true
+        coroutineScope.launch {
+            try {
+                val result = Firebase.firestore.collection("store_items")
+                    .whereEqualTo("miniRes", miniResId)
+                    .whereEqualTo("subCategory", subCategoryName)
+                    .get().await()
+
+                if (result.isEmpty) {
+                    Toast.makeText(context, "No items found in this sub-category", Toast.LENGTH_SHORT).show()
+                    return@launch
+                }
+
+                val batch = Firebase.firestore.batch()
+                result.documents.forEach { doc ->
+                    batch.update(doc.reference, "itemDiscount", percent)
+                }
+                batch.commit().await()
+
+                Toast.makeText(context, "Discount applied to ${result.size()} item(s)", Toast.LENGTH_SHORT).show()
+                refreshItems()
+            } catch (e: Exception) {
+                Toast.makeText(context, "Error applying discount: ${e.message}", Toast.LENGTH_LONG).show()
+            } finally {
+                isApplyingDiscount = false
+            }
+        }
+    }
+
     LaunchedEffect(Unit) {
         refreshItems()
     }
@@ -96,6 +129,18 @@ fun RestaurantItemListScreen(
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
+                actions = {
+                    IconButton(
+                        onClick = { showDiscountDialog = true },
+                        enabled = !isApplyingDiscount
+                    ) {
+                        if (isApplyingDiscount) {
+                            CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+                        } else {
+                            Icon(Icons.Default.Percent, contentDescription = "Set Discount")
+                        }
                     }
                 }
             )
@@ -192,7 +237,62 @@ fun RestaurantItemListScreen(
                 fixedSubCategory = subCategoryName
             )
         }
+
+        if (showDiscountDialog) {
+            SetDiscountDialog(
+                onDismiss = { showDiscountDialog = false },
+                onApply = { percent ->
+                    showDiscountDialog = false
+                    applyDiscountToAllItems(percent)
+                }
+            )
+        }
     }
+}
+
+// Dialog to collect a discount percentage and apply it to every item in the sub-category
+@Composable
+fun SetDiscountDialog(
+    onDismiss: () -> Unit,
+    onApply: (Double) -> Unit
+) {
+    var discountText by remember { mutableStateOf("") }
+    val context = LocalContext.current
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("Set Discount") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    "This will apply the discount to ALL items in this sub-category.",
+                    style = MaterialTheme.typography.bodySmall
+                )
+                TextField(
+                    value = discountText,
+                    onValueChange = { discountText = it },
+                    label = { Text("Discount (%)") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number)
+                )
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                val percent = discountText.toDoubleOrNull()
+                if (percent == null || percent < 0 || percent > 100) {
+                    Toast.makeText(context, "Enter a valid percentage (0-100).", Toast.LENGTH_SHORT).show()
+                    return@Button
+                }
+                onApply(percent)
+            }) {
+                Text("Apply")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
 }
 
 // Re-using the card from the admin app

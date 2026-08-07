@@ -69,5 +69,6 @@ data class PartnerOrder(
     val userPhone: String = "", // Added this field
     val totalPrice: Double = 0.0, // This is the TOTAL order price
     val createdAt: Timestamp = Timestamp.now(),
-    val items: List<OrderItemDetail> = emptyList() // This list is FILTERED
+    val items: List<OrderItemDetail> = emptyList(), // This list is FILTERED
+    val userNote: String = "" // Optional note the customer added at checkout
 )

@@ -377,6 +377,15 @@ fun PartnerOrderCard(
                 }
             }
 
+            if (order.userNote.isNotBlank()) {
+                Text(
+                    "Note: ${order.userNote}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color(0xFFE65100),
+                    modifier = Modifier.padding(top = 4.dp)
+                )
+            }
+
             Spacer(Modifier.height(12.dp))
             Divider()
             Spacer(Modifier.height(12.dp))
